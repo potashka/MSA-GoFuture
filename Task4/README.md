@@ -35,3 +35,8 @@
 ([01-data-pipeline.md](01-data-pipeline.md)) — только агрегированные и
 анонимизированные данные когда-либо реплицируются в аналитический
 (домашний) регион `core`.
+
+## Скриншоты диаграмм
+
+Готовый PNG-рендер [c4-data-pipeline.puml](c4-data-pipeline.puml) — в
+[../renders/Task4/](../renders/Task4/).

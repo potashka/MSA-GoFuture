@@ -46,3 +46,9 @@ Kafka-модель Task2, региональную модель и IAM/security-
   ([Task3/01-region-selection.md](../Task3/01-region-selection.md)), а не
   описан заново — с соответствующим более долгим сроком, вне целевых
   2–4 недель типового онбординга.
+
+## Скриншоты диаграмм
+
+Готовые PNG-рендеры [c2-multitenancy.puml](c2-multitenancy.puml) и
+[c3-onboarding.puml](c3-onboarding.puml) — в
+[../renders/Task5/](../renders/Task5/).

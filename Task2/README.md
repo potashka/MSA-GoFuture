@@ -42,3 +42,8 @@
 набора, используемого во всех артефактах Task2 — при дальнейшей работе с
 [Task1/c2-to-be.puml](../Task1/c2-to-be.puml) имена событий на нём следует
 свести к этому каталогу.
+
+## Скриншоты диаграмм
+
+Готовый PNG-рендер [c2-event-platform.puml](c2-event-platform.puml) — в
+[../renders/Task2/](../renders/Task2/).

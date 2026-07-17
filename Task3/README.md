@@ -55,3 +55,11 @@ C2 To-Be) и Task2 (событийная платформа, региональ�
 Все 4 файла `.puml` в этой директории скомпилированы локально через
 PlantUML (`plantuml.jar`, с реальной загрузкой стандартной библиотеки
 C4-PlantUML из интернета) без ошибок компиляции.
+
+## Скриншоты диаграмм
+
+Готовые PNG-рендеры всех 4 диаграмм ([replication-schema.puml](replication-schema.puml),
+[geo-routing-schema.puml](geo-routing-schema.puml),
+[failover-c4.puml](failover-c4.puml),
+[c2-to-be-security.puml](c2-to-be-security.puml)) — в
+[../renders/Task3/](../renders/Task3/).
