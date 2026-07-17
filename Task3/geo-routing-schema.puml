@@ -1,0 +1,42 @@
+@startuml geo-routing-schema
+title Геомаршрутизация — вход в ближайший регион, редирект в домашний регион при роуминге
+
+actor "Пассажир\n(домашний регион jkt)" as user
+participant "GeoDNS /\nlatency-based routing" as dns
+participant "Anycast IP\nAPI Gateway" as anycast
+participant "API Gateway\n(регион sgp — ближайший)" as gwSgp
+participant "API Gateway\n(регион jkt — домашний)" as gwJkt
+participant "Identity Service" as identity
+participant "Booking Service\n(регион jkt)" as booking
+
+user -> dns : Резолв доменного имени API
+dns -> user : Ближайший по сети регион (sgp)
+user -> anycast : Запрос (несёт токен с claim home_region=jkt)
+anycast -> gwSgp : BGP направляет на ближайший анонс (sgp)
+
+gwSgp -> gwSgp : Проверка claim home_region в токене
+note right of gwSgp
+  home_region = jkt
+  регион входа = sgp
+  => несовпадение (роуминг)
+end note
+
+alt Вариант (а): прозрачное проксирование
+    gwSgp -> gwJkt : Проксирование запроса в домашний регион
+    gwJkt -> booking : Обработка запроса (данные пользователя в jkt)
+    booking -> gwJkt : Ответ
+    gwJkt -> gwSgp : Ответ
+    gwSgp -> user : Ответ (с доп. задержкой межрегионального прыжка)
+else Вариант (б): редирект клиента на домашний регион
+    gwSgp -> user : Указание region endpoint = jkt
+    user -> gwJkt : Последующие запросы напрямую в jkt (в т.ч. long-lived сессии: поток локации)
+    gwJkt -> booking : Обработка запроса
+    booking -> gwJkt : Ответ
+    gwJkt -> user : Ответ (без повторного прыжка через sgp)
+end
+
+user -> identity : Аутентификация (в любом регионе)
+identity -> identity : Проверка по глобальному IAM-индексу\n(асинхронно реплицированному, см. 02-replication.md)
+identity -> user : Токен с claim home_region=jkt
+
+@enduml

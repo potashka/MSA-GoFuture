@@ -1,0 +1,91 @@
+@startuml failover-c4
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Deployment.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Диаграмма аварийного переключения (C4) — точки отказа на примере региона Джакарта (jkt)
+
+System_Ext(paymentProvider, "Платёжный шлюз (региональный / Яндекс Пэй)", "Внешний провайдер")
+System_Ext(mapsProvider, "Картографический провайдер (региональный / Яндекс Карты)", "Внешний провайдер")
+
+Deployment_Node(dns, "GeoDNS / Anycast", "Глобальный сетевой слой", "Anycast-анонс API Gateway из всех регионов; withdrawal при отказе региона (см. 03-geo-routing.md)")
+
+Deployment_Node(jkt, "Регион: Джакарта (jkt)"){
+
+    Deployment_Node(az1, "Зона доступности 1"){
+        Container(gw1, "API Gateway", "Instance", "Точка отказа: под/инстанс")
+        Container(kafka1, "Kafka broker", "Instance", "Точка отказа: брокер")
+        ContainerDb(pg1, "PostgreSQL", "Primary", "Точка отказа: первичный узел")
+    }
+    Deployment_Node(az2, "Зона доступности 2"){
+        Container(gw2, "API Gateway", "Instance")
+        Container(kafka2, "Kafka broker", "Instance")
+        ContainerDb(pg2, "PostgreSQL", "Sync standby")
+    }
+    Deployment_Node(az3, "Зона доступности 3"){
+        Container(gw3, "API Gateway", "Instance")
+        Container(kafka3, "Kafka broker", "Instance")
+        ContainerDb(pg3, "PostgreSQL", "Sync standby")
+    }
+
+    Container(payments, "Payments Service", "Domain Service", "Circuit breaker к внешнему платёжному провайдеру")
+    Container(geography, "Geography Service", "Domain Service", "Circuit breaker к картографическому провайдеру")
+}
+
+Rel(dns, gw1, "Anycast-маршрутизация")
+Rel(dns, gw2, "Anycast-маршрутизация")
+Rel(dns, gw3, "Anycast-маршрутизация")
+
+Rel(pg1, pg2, "Синхронная репликация")
+Rel(pg1, pg3, "Синхронная репликация")
+Rel(kafka1, kafka2, "RF=3 по зонам")
+Rel(kafka1, kafka3, "RF=3 по зонам")
+
+Rel(payments, paymentProvider, "Авторизация платежа", "circuit breaker")
+Rel(geography, mapsProvider, "Маршрутизация/ETA", "circuit breaker")
+
+note right of gw1
+  Отказ инстанса/зоны Gateway:
+  автоматическое исключение из ротации
+  (RTO секунды, см. 04-failover.md)
+end note
+
+note right of pg1
+  Отказ первичного узла/зоны:
+  автоматический promotion
+  синхронного standby
+  (RTO <= 5 мин, RPO ~ 0)
+end note
+
+note right of kafka1
+  Отказ брокера/зоны:
+  автоматическое перевыбрание
+  лидера партиции среди ISR
+  (RTO секунды, RPO ~ 0 при
+  min.insync.replicas=2)
+end note
+
+note bottom of jkt
+  Отказ региона целиком:
+  Anycast withdrawal — автоматически
+  (защищает новые запросы из др. регионов).
+  Восстановление данных/сервиса в jkt —
+  процедура с участием человека,
+  регуляторное ограничение по UU PDP
+  (см. 04-failover.md, 05-compliance.md).
+end note
+
+note right of payments
+  Отказ платёжного провайдера:
+  circuit breaker, деградация до
+  отмены заказа (Saga-компенсация,
+  см. Task2/04-saga.md)
+end note
+
+note right of geography
+  Отказ картографического провайдера:
+  circuit breaker, деградация точности
+  ETA/маршрутизации
+end note
+
+@enduml

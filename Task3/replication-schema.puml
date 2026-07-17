@@ -1,0 +1,84 @@
+@startuml replication-schema
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Deployment.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Схема репликации — региональный шардинг + внутрирегиональная репликация по зонам
+
+Deployment_Node(jkt, "Регион: Джакарта (jkt)", "Индонезия, UU PDP"){
+    Deployment_Node(jktAz1, "Зона доступности 1"){
+        ContainerDb(jktPgPrimary, "Booking/Driver/Payments DB", "PostgreSQL (primary)", "Данные поездок, локаций, платежей — только этот регион")
+        Container(jktKafka1, "Kafka broker", "Apache Kafka", "Реплика партиции")
+    }
+    Deployment_Node(jktAz2, "Зона доступности 2"){
+        ContainerDb(jktPgStandby1, "Booking/Driver/Payments DB", "PostgreSQL (sync standby)", "Синхронный standby")
+        Container(jktKafka2, "Kafka broker", "Apache Kafka", "Реплика партиции")
+    }
+    Deployment_Node(jktAz3, "Зона доступности 3"){
+        ContainerDb(jktPgStandby2, "Booking/Driver/Payments DB", "PostgreSQL (sync standby)", "Синхронный standby")
+        Container(jktKafka3, "Kafka broker", "Apache Kafka", "Реплика партиции")
+    }
+}
+
+Deployment_Node(sgp, "Регион: Сингапур (sgp)", "Хаб ЮВА"){
+    Deployment_Node(sgpAz1, "Зона доступности 1"){
+        ContainerDb(sgpPgPrimary, "Booking/Driver/Payments DB", "PostgreSQL (primary)", "Данные поездок, локаций, платежей — только этот регион")
+        Container(sgpKafka1, "Kafka broker", "Apache Kafka", "Реплика партиции")
+    }
+    Deployment_Node(sgpAz2, "Зона доступности 2"){
+        ContainerDb(sgpPgStandby1, "Booking/Driver/Payments DB", "PostgreSQL (sync standby)", "Синхронный standby")
+        Container(sgpKafka2, "Kafka broker", "Apache Kafka", "Реплика партиции")
+    }
+    Deployment_Node(sgpAz3, "Зона доступности 3"){
+        ContainerDb(sgpPgStandby2, "Booking/Driver/Payments DB", "PostgreSQL (sync standby)", "Синхронный standby")
+        Container(sgpKafka3, "Kafka broker", "Apache Kafka", "Реплика партиции")
+    }
+}
+
+Deployment_Node(sao, "Регион: Сан-Паулу (sao)", "Бразилия, LGPD"){
+    Deployment_Node(saoAz1, "Зона доступности 1"){
+        ContainerDb(saoPgPrimary, "Booking/Driver/Payments DB", "PostgreSQL (primary)", "Данные поездок, локаций, платежей — только этот регион")
+        Container(saoKafka1, "Kafka broker", "Apache Kafka", "Реплика партиции")
+    }
+    Deployment_Node(saoAz2, "Зона доступности 2"){
+        ContainerDb(saoPgStandby1, "Booking/Driver/Payments DB", "PostgreSQL (sync standby)", "Синхронный standby")
+        Container(saoKafka2, "Kafka broker", "Apache Kafka", "Реплика партиции")
+    }
+    Deployment_Node(saoAz3, "Зона доступности 3"){
+        ContainerDb(saoPgStandby2, "Booking/Driver/Payments DB", "PostgreSQL (sync standby)", "Синхронный standby")
+        Container(saoKafka3, "Kafka broker", "Apache Kafka", "Реплика партиции")
+    }
+}
+
+Deployment_Node(core, "Домашний регион (core)", "Yandex Cloud"){
+    Container(adminPanel, "Админ-панель", "Web", "Управление платформой")
+    ContainerDb(globalRefStore, "Global Reference Store", "PostgreSQL", "Справочники, конфигурация, тонкий IAM-индекс (глобальный ID + домашний регион), Schema Registry")
+}
+
+Rel(jktPgPrimary, jktPgStandby1, "Синхронная репликация")
+Rel(jktPgPrimary, jktPgStandby2, "Синхронная репликация")
+Rel(sgpPgPrimary, sgpPgStandby1, "Синхронная репликация")
+Rel(sgpPgPrimary, sgpPgStandby2, "Синхронная репликация")
+Rel(saoPgPrimary, saoPgStandby1, "Синхронная репликация")
+Rel(saoPgPrimary, saoPgStandby2, "Синхронная репликация")
+
+Rel(jktKafka1, jktKafka2, "RF=3, реплика партиции по зонам")
+Rel(jktKafka1, jktKafka3, "RF=3, реплика партиции по зонам")
+Rel(sgpKafka1, sgpKafka2, "RF=3, реплика партиции по зонам")
+Rel(sgpKafka1, sgpKafka3, "RF=3, реплика партиции по зонам")
+Rel(saoKafka1, saoKafka2, "RF=3, реплика партиции по зонам")
+Rel(saoKafka1, saoKafka3, "RF=3, реплика партиции по зонам")
+
+Rel(globalRefStore, jktPgPrimary, "Асинхронная репликация: справочники, конфигурация, IAM-индекс", "eventual consistency")
+Rel(globalRefStore, sgpPgPrimary, "Асинхронная репликация: справочники, конфигурация, IAM-индекс", "eventual consistency")
+Rel(globalRefStore, saoPgPrimary, "Асинхронная репликация: справочники, конфигурация, IAM-индекс", "eventual consistency")
+
+note right of globalRefStore
+  Данные поездок, локаций и платежей
+  НЕ реплицируются глобально —
+  региональный шардинг (см. 02-replication.md).
+  Глобально реплицируются только
+  справочники/конфигурация/тонкий IAM-индекс.
+end note
+
+@enduml
