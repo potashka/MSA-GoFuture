@@ -46,8 +46,9 @@
 
 - **Terraform** — декларативное, одноразовое на этапе онбординга
   провижининг ресурсов, для которых достаточно один раз применить
-  описание состояния: realm и клиенты Keycloak, топики/ACL Kafka, объекты
-  квот/rate-limit API Gateway, дашборды и datasource Grafana.
+  описание состояния: realm и клиенты Keycloak, DB roles/RLS policy
+  checks, Kafka topics/ACL/quotas, encryption keys, объекты квот/rate-limit
+  API Gateway, дашборды и datasource Grafana.
 - **Kubernetes operator** (кастомный `Tenant` CRD и контроллер) —
   постоянное согласование фактического состояния тенанта с желаемым:
   обрабатывает изменения уровня изоляции post-factum ([01-tenancy-model.md](01-tenancy-model.md)),
@@ -79,20 +80,28 @@
    корпоративным IdP партнёра (OIDC/SAML, [02-iam.md](02-iam.md)).
    **Автоматизация**: Terraform, вызывается Onboarding Service.
 
-3. **Создание схемы БД / RLS-политик.** Для pool-тенанта: регистрация
-   `tenant_id` в справочнике тенантов и проверка (автоматическим тестом,
-   не вручную), что RLS-политики уже покрывают все таблицы, содержащие
-   тенант-специфичные данные ([01-tenancy-model.md](01-tenancy-model.md)).
-   Для silo-тенанта: Terraform создаёт выделенную схему/БД на каждый
-   сервис и прогоняет стандартные миграции сервиса на новую
-   схему/БД. **Автоматизация**: Terraform (провижининг) + существующие
-   инструменты миграции схем сервисов.
+3. **Создание tenant record, ключей и DB policy.** Для pool-тенанта:
+   регистрация `tenant_id` в справочнике tenants, выпуск/привязка
+   encryption key alias, проверка, что application roles не `superuser`,
+   не `BYPASSRLS` и не owner таблиц, а RLS-политики включены как
+   fail-closed (`ENABLE`, `FORCE`, `USING`, `WITH CHECK`) на всех
+   tenant-specific таблицах ([01-tenancy-model.md](01-tenancy-model.md)).
+   Для dedicated/silo-тенанта Terraform создаёт выделенную схему/БД на
+   каждый сервис, отдельные runtime roles и прогоняет стандартные миграции.
+   **Автоматизация**: Terraform (провижининг) + миграции сервисов +
+   automated RLS policy checks.
 
-4. **Создание топиков Kafka.** Для pool-тенанта: резервирование
-   подмножества партиций существующих региональных топиков за
-   `tenant_id` ([01-tenancy-model.md](01-tenancy-model.md)). Для
-   silo-тенанта: Terraform (Kafka provider) создаёт выделенные топики
-   `{region}.{tenant}.{domain}.{event}`. **Автоматизация**: Terraform.
+4. **Настройка Kafka topics, ACL, quotas и keys.** Для pool-тенанта:
+   используются shared regional topics; Terraform/оператор создаёт client
+   credentials, topic/group ACL на разрешённые shared topics, producer и
+   consumer quotas, tenant-tier routing labels и проверяет, что события
+   публикуются с `tenant_id` в envelope и record key
+   `tenant_id:business_key` ([01-tenancy-model.md](01-tenancy-model.md)).
+   Для крупных dedicated tenants создаются dedicated topics
+   `{region}.{tenant}.{domain}.{event}`, отдельные quotas и encryption
+   keys. Для strict silo при необходимости создаётся отдельный Kafka
+   cluster как отдельный проект, а не как обычный шаг pool onboarding.
+   **Автоматизация**: Terraform/Kafka provider + Tenant Operator.
 
 5. **Настройка квот и rate limiting на API Gateway.** Onboarding Service
    применяет (через Terraform или напрямую через API/CRD Gateway)
@@ -102,11 +111,12 @@
    operator (объект конфигурации Gateway как CRD).
 
 6. **Дашборды Grafana.** Provisioning параметризованных шаблонов
-   дашбордов (переменная/метка `tenant_id`, дополняющая существующий
-   мониторинг, [Task2/06-monitoring.md](../Task2/06-monitoring.md)) через
-   Terraform (Grafana provider) — переиспользование готовых шаблонов, а не
-   ручное создание дашборда с нуля на каждого тенанта. **Автоматизация**:
-   Terraform.
+   дашбордов по `tenant_tier`, региону, service/topic и ограниченному
+   drill-down по конкретному `tenant_id` для incident investigation
+   (дополняет существующий мониторинг,
+   [Task2/06-monitoring.md](../Task2/06-monitoring.md)). Это избегает
+   неконтролируемой высокой кардинальности в базовых метриках.
+   **Автоматизация**: Terraform.
 
 7. **Конфигурация локальных платёжных и картографических провайдеров.**
    Onboarding Service настраивает Payments Service и Geography Service
@@ -120,15 +130,20 @@
    в целевые 2–4 недели (см. риски). **Автоматизация**: Onboarding
    Service (вызовы API провайдеров) + Secrets Manager.
 
-8. **Smoke-тесты.** Автоматический сквозной прогон: тестовое бронирование
+8. **Smoke, isolation и negative tests.** Автоматический сквозной прогон:
+   тестовое бронирование
    через полную сагу ([Task2/04-saga.md](../Task2/04-saga.md)) в
-   изолированном тестовом контексте тенанта; попытка кросс-тенантного
-   чтения данных, которая должна завершиться отказом (проверка RLS,
-   [01-tenancy-model.md](01-tenancy-model.md)); проверка, что события
-   несут верный `tenant_id` и попадают в ожидаемые партиции/топики;
-   проверка входа через Keycloak (в т. ч. SSO, если настроен); проверка,
-   что дашборд Grafana тенанта отображает данные; проверка срабатывания
-   квот/rate limiting. Отказ любой проверки останавливает переход к
+   изолированном тестовом контексте тенанта; tenant A читает свои данные;
+   tenant A не читает tenant B; tenant A не пишет строки tenant B; запрос
+   без `SET LOCAL app.tenant_id` получает deny; platform break-glass
+   доступ требует MFA/ticket/reason и логируется; producer не публикует
+   событие без `tenant_id`; consumer не обрабатывает event с чужим
+   `tenant_id`; record key соответствует `tenant_id:business_key`;
+   dedicated tenant использует dedicated topics/quotas/keys; проверка
+   входа через Keycloak (в т. ч. SSO, если настроен); проверка, что
+   дашборд Grafana отображает tenant-tier/tenant data с ограниченной
+   cardinality; проверка срабатывания квот/rate limiting. Отказ любой
+   проверки останавливает переход к
    следующему шагу и возвращает статус `Tenant` в `failed` с указанием
    причины. **Автоматизация**: пайплайн smoke-тестов, запускаемый
    Onboarding Service (тот же принцип, что и обязательные учения отката в

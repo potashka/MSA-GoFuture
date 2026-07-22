@@ -1,4 +1,4 @@
-@startuml Context_Diagram_With_Payouts
+@startuml context-c1
 !include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Context.puml
 
 Person(passenger, "Пассажир", "Заказывает, отслеживает и оплачивает поездки")

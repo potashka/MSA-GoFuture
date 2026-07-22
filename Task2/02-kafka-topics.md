@@ -25,9 +25,13 @@
   [Task1/01-nfr.md](../Task1/01-nfr.md)).
 - Партиционирование должно сохранять порядок там, где это важно для
   бизнес-логики: `booking_id` — для событий саги поездки (порядок шагов в
-  рамках одной поездки, см. [04-saga.md](04-saga.md)), `geo_cell`/`city_id`
-  — для событий, привязанных к географической зоне, а не к конкретной
-  поездке.
+  рамках одной поездки, см. [04-saga.md](04-saga.md)), `region_id:driver_id`
+  или `driver_id` — для локации водителя, `geo_cell` — для событий
+  состояния зоны и последующей группировки в stream processing.
+- В мультитенантной модели Task5 для shared topics Kafka record key
+  получает tenant prefix: `tenant_id:business_key`. Это сохраняет порядок
+  внутри tenant и business entity и не является partition-level ACL
+  ([Task5/01-tenancy-model.md](../Task5/01-tenancy-model.md)).
 - Пропускная способность топиков должна выдерживать целевую нагрузку П1
   ([Task1/01-nfr.md](../Task1/01-nfr.md)) с запасом для пиков и
   автоскейлинга (требование М3).
@@ -45,7 +49,10 @@
 имени топика соответствуют домену-продюсеру и событию из
 [01-domain-events.md](01-domain-events.md) в kebab-case, например:
 `sea.driver.location.updated`, `sea.pricing.surge-activated`,
-`sea.fraud.check-completed`, `sea.notification.requested`.
+`sea.fraud.check-completed`, `sea.notification.requested`. Операционные
+команды и результатные события Saga из [04-saga.md](04-saga.md)
+именуются тем же образом, но живут в namespace `{region}.saga.*`, если не
+являются публичным доменным фактом из каталога.
 
 ### Региональная изоляция как первый уровень
 
@@ -67,18 +74,20 @@ ClickHouse в общее хранилище — это отдельный про
 
 ### Группы топиков
 
-| Группа | Топики (пример для региона `sea`) | Ключ партиции | Партиций/регион | Replication factor | cleanup.policy | Retention |
+| Группа | Топики (пример для региона `sea`) | Kafka record key / ключ партиции | Партиций/регион | Replication factor | cleanup.policy | Retention |
 |---|---|---|---|---|---|---|
-| Booking lifecycle | `sea.booking.created`, `sea.booking.confirmed`, `sea.booking.cancelled` | `booking_id` | 24 | 3 | delete | 7 дней (`cancelled` — 14 дней) |
-| Driver assignment | `sea.driver.assigned` | `booking_id` | 24 | 3 | delete | 7 дней |
-| Driver location (высокочастотный) | `sea.driver.location.updated` | `geo_cell` | 96 | 3 | compact,delete | `retention.ms` ≈ 15 минут + compaction по `driver_id` |
-| Pricing | `sea.pricing.calculated` | `booking_id` | 24 | 3 | delete | 7 дней |
-| Pricing (surge, состояние зоны) | `sea.pricing.surge-activated` | `geo_cell` | 24 | 3 | compact,delete | 24 часа + compaction по `geo_cell` |
-| Payments | `sea.payments.authorized`, `sea.payments.captured`, `sea.payments.failed` | `booking_id` | 24 | 3 | delete | 30 дней |
-| Payouts | `sea.payouts.initiated`, `sea.payouts.completed` | `driver_id` | 12 | 3 | delete | 90 дней |
-| Fraud | `sea.fraud.check-completed` | `booking_id` | 24 | 3 | delete | 30 дней |
-| Ride lifecycle | `sea.ride.started`, `sea.ride.completed` | `booking_id` | 24 | 3 | delete | 7 дней (`completed` — 30 дней) |
-| Notification | `sea.notification.requested` | `recipient_id` | 24 | 3 | delete | 3 дня |
+| Booking lifecycle | `sea.booking.created`, `sea.booking.confirmed`, `sea.booking.cancelled` | `booking_id`; в shared topics Task5: `tenant_id:booking_id` | параметр ёмкости, стартово 24 | 3 | delete | 7 дней (`cancelled` — 14 дней) |
+| Saga commands | `sea.saga.fraud-check.requested`, `sea.saga.price-lock.requested`, `sea.saga.driver-reservation.requested`, `sea.saga.payment-authorization.requested`, `sea.saga.booking-cancellation.requested`, `sea.saga.driver-release.requested`, `sea.saga.payment-release.requested` | `booking_id`; в shared topics Task5: `tenant_id:booking_id` | параметр ёмкости, стартово 24 | 3 | delete | 3 дня |
+| Saga result events | `sea.saga.price-locked`, `sea.saga.price-lock-failed`, `sea.saga.driver-reserved`, `sea.saga.driver-reservation-failed`, `sea.saga.payment-authorization-failed`, `sea.saga.driver-released`, `sea.saga.payment-released`; публичные результаты вроде `sea.fraud.check-completed` и `sea.payments.authorized` остаются в доменных топиках | `booking_id`; в shared topics Task5: `tenant_id:booking_id` | параметр ёмкости, стартово 24 | 3 | delete | 7 дней |
+| Driver assignment | `sea.driver.assigned` | `booking_id`; в shared topics Task5: `tenant_id:booking_id` | параметр ёмкости, стартово 24 | 3 | delete | 7 дней |
+| Driver location (высокочастотный) | `sea.driver.location.updated` | `driver_id` внутри регионального топика; для общего namespace допустим `region_id:driver_id`; в shared topics Task5: `tenant_id:region_id:driver_id` или `tenant_id:driver_id` внутри регионального топика | параметр ёмкости, стартово 96 | 3 | compact,delete | короткое окно (`retention.ms`, стартово 15–60 минут) + compaction по record key tenant+водителя |
+| Pricing | `sea.pricing.calculated` | `booking_id` | параметр ёмкости, стартово 24 | 3 | delete | 7 дней |
+| Pricing (surge, состояние зоны) | `sea.pricing.surge-activated` | `geo_cell` | параметр ёмкости, стартово 24 | 3 | compact,delete | 24 часа + compaction по `geo_cell` |
+| Payments | `sea.payments.authorized`, `sea.payments.captured`, `sea.payments.failed` | `booking_id` | параметр ёмкости, стартово 24 | 3 | delete | 30 дней |
+| Payouts | `sea.payouts.initiated`, `sea.payouts.completed` | `driver_id` | параметр ёмкости, стартово 12 | 3 | delete | 90 дней |
+| Fraud | `sea.fraud.check-completed` | `booking_id` | параметр ёмкости, стартово 24 | 3 | delete | 30 дней |
+| Ride lifecycle | `sea.ride.started`, `sea.ride.completed` | `booking_id` | параметр ёмкости, стартово 24 | 3 | delete | 7 дней (`completed` — 30 дней) |
+| Notification | `sea.notification.requested` | `recipient_id` | параметр ёмкости, стартово 24 | 3 | delete | 3 дня |
 | DLQ (см. [05-delivery-guarantees.md](05-delivery-guarantees.md)) | `{topic}.dlq` | наследует ключ исходного топика | = партициям исходного топика | 3 | delete | 30 дней (время на разбор) |
 
 `min.insync.replicas = 2` для всех групп при `replication.factor = 3` —
@@ -88,7 +97,7 @@ ClickHouse в общее хранилище — это отдельный про
 
 ### Обоснование числа партиций (инженерная оценка, требует нагрузочной проверки)
 
-- **Booking/Driver/Pricing/Payments/Fraud/Ride lifecycle топики (24
+- **Booking/Driver/Pricing/Payments/Fraud/Ride lifecycle топики (стартово 24
   партиции/регион)**: при 500 тыс. конкурентных поездок платформы и средней
   длительности поездки около 20 минут, по формуле Литтла среднее число
   новых бронирований — порядка 25 тыс./мин ≈ 417/сек по всей платформе;
@@ -98,23 +107,25 @@ ClickHouse в общее хранилище — это отдельный про
   событий/сек в самом нагруженном регионе на группу топиков. 24 партиции
   дают запас параллелизма (до 24 инстансов потребителя на топик) и
   комфортный запас пропускной способности на партицию.
-- **`driver.location.updated` (96 партиций/регион)**: при частоте пинга раз
+- **`driver.location.updated` (стартово 96 партиций/регион)**: при частоте пинга раз
   в 3–5 секунд на активного водителя (требование П3,
   [Task1/01-nfr.md](../Task1/01-nfr.md)) и оценочном пуле водителей,
   на порядок превышающем число одновременных поездок, поток на пике может
   достигать десятков-сотен тысяч событий/сек в регионе — требуется
-  существенно больше партиций, чем для операционных топиков саги, и ключ
-  `geo_cell` (а не `city_id`) для равномерного распределения нагрузки
-  между партициями: `city_id` даёт слишком крупную гранулярность и рискует
-  создать "горячую" партицию на самом крупном городе региона, тогда как
-  `geo_cell` (ячейка H3/S2) распределяет нагрузку внутри города по
-  множеству ячеек, оставляя агрегацию по городу возможной на уровне Flink
-  (группировка ячеек), а не на уровне партиционирования Kafka.
-- **Payouts (12 партиций/регион)**: объём ниже, чем у операционных событий
+  существенно больше партиций, чем для операционных топиков саги. Kafka
+  record key — `driver_id` внутри отдельного регионального топика
+  (`sea.driver.location.updated`) или `region_id:driver_id` в общем
+  namespace. Так Kafka гарантирует порядок обновлений одного водителя и
+  log compaction сохраняет последнее известное состояние именно водителя.
+  `geo_cell` остаётся в payload; Flink после чтения из Kafka выполняет
+  `keyBy(event.payload.geo_cell)` и уже там строит оконные агрегаты по
+  геоячейкам.
+- **Payouts (стартово 12 партиций/регион)**: объём ниже, чем у операционных событий
   саги (выплаты пакетные/периодические, не на каждую поездку), меньшее
   число партиций достаточно.
 
-Все числа партиций — отправная точка (по аналогии с оговоркой в
+Все числа партиций — настраиваемые параметры ёмкости и стартовая инженерная
+оценка (по аналогии с оговоркой в
 [Task1/01-nfr.md](../Task1/01-nfr.md) о целевых значениях НФТ) и подлежат
 проверке нагрузочным тестированием на этапе внедрения каждого топика.
 
@@ -147,11 +158,14 @@ ClickHouse в общее хранилище — это отдельный про
   [Task1/01-nfr.md](../Task1/01-nfr.md)) — партиция является логическим, а
   не физическим/географическим разделением; данные региона физически
   остаются в одном кластере независимо от того, как они партиционированы.
-- **Ключ партиции `city_id` вместо `geo_cell` для `driver.location.updated`
-  как основной вариант.** Рассмотрено как более простой; отклонено в
-  пользу `geo_cell` из-за риска "горячей" партиции в крупнейших городах
-  региона (высокая концентрация водителей в одном мегаполисе перегрузила бы
-  соответствующие партиции непропорционально относительно остальных).
+- **Ключ партиции `geo_cell` или `city_id` для `driver.location.updated`
+  как основной вариант.** Отклонено: Kafka log compaction работает по record
+  key, поэтому при ключе `geo_cell` compacted topic хранил бы последнее
+  состояние ячейки, а не каждого водителя. При движении водитель меняет
+  ячейки, и его события могли бы попасть в разные партиции, нарушая порядок
+  обработки для одного `driver_id`. `city_id` ещё грубее и создаёт горячие
+  партиции в крупнейших городах. Географическая группировка переносится в
+  Flink через `keyBy(event.payload.geo_cell)`.
 - **Protobuf вместо Avro для Schema Registry.** Рассмотрено как
   жизнеспособная альтернатива (более удобна при необходимости генерации
   клиентского кода на большем числе языков программирования); отклонено в

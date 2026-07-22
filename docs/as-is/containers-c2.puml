@@ -1,4 +1,4 @@
-@startuml Container_Diagram_Full_Infrastructure
+@startuml containers-c2
 !include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
 
 Person(passenger, "Пассажир", "Заказывает поездки")

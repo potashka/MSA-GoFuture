@@ -35,8 +35,9 @@
 
 ## Решение
 
-На [c2-to-be-security.puml](c2-to-be-security.puml) добавлены пять новых
-элементов (выделены красным, легенда "красное = новые/изменённые элементы
+На [c2-to-be-security.puml](c2-to-be-security.puml) добавлены и уточнены
+элементы безопасности и геомаршрутизации (выделены красным, легенда
+"красное = новые/изменённые элементы
 относительно [Task1/c2-to-be.puml](../Task1/c2-to-be.puml)"):
 
 ### WAF перед API Gateway
@@ -83,6 +84,34 @@ Mesh централизует выпуск и ротацию сертифика�
 инфраструктуры это стало бы обязанностью каждой доменной команды
 реализовывать и поддерживать самостоятельно, с риском расхождения
 практик и постепенной эрозии требования Б1 со временем.
+
+### Ride Region Resolver и profile projection
+
+Геомаршрутизация из [03-geo-routing.md](03-geo-routing.md) требует
+разделить `profile_region` и `ride_region`: токен указывает регион
+профиля, но операционная поездка должна попасть в регион оказания услуги.
+Ride Region Resolver определяет `ride_region` по точке посадки, выбранному
+городу, tenant/market и конфигурации приложения, а не по постоянному
+региону профиля. Это важно и с точки зрения безопасности: сервисы hot path
+не получают права ходить в пользовательскую БД другого региона на каждый
+location update.
+
+Profile Attributes Projection — локальная read-only projection минимальных
+разрешённых атрибутов профиля без PII. Она позволяет Booking/Fraud realtime
+в `ride_region` принять решение по заказу без прямого межрегионального
+доступа к profile DB. Состав projection должен быть allowlist-based и
+проходить комплаенс-ревью вместе со схемами данных.
+
+### Regional HA baseline
+
+Усиленная цель 99,99% для Tier-1 ride APIs из
+[04-failover.md](04-failover.md) требует, чтобы контур безопасности не
+становился единой точкой отказа. WAF/API Gateway, Service Mesh sidecars,
+Secrets Manager clients и критичные политики авторизации должны работать
+в нескольких AZ внутри каждого production-региона. Для Kubernetes workloads
+используются PodDisruptionBudget, anti-affinity/topology spread,
+autoscaling и несколько ingress/gateway instances; это защищает Tier-1
+путь от отказа pod, node или одной availability zone без планового простоя.
 
 ### Secrets Manager
 

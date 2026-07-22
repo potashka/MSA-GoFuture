@@ -33,10 +33,34 @@
   проследить до исходного события — необходимо для отладки и для аудита
   анонимизирующего экспорта ([01-data-pipeline.md](01-data-pipeline.md),
   [Task3/05-compliance.md](../Task3/05-compliance.md)).
+- Ключевые витрины и feature sets должны иметь измеримый quality score,
+  freshness SLA, владельца и алерты; DataLens не должен читать сырые Kafka
+  topics или raw PII.
 
 ## Решение
 
-Семь механизмов, каждый — на своём этапе пайплайна и для своей проблемы.
+Набор механизмов качества строится вокруг data contracts, автоматических
+проверок, quarantine/DLQ, replay, lineage, data catalog, quality score и
+алертов. Проверки применяются к raw restricted zone, pseudonymized
+operational analytics и anonymized aggregated datasets из
+[01-data-pipeline.md](01-data-pipeline.md).
+
+### Data quality dimensions
+
+| Dimension | Проверка | Инструмент | Порог | Реакция | Владелец |
+|---|---|---|---|---|---|
+| Schema validity | Событие соответствует Avro-схеме и BACKWARD compatibility; обязательные envelope-поля есть | Schema Registry, producer contract tests, CI | 100% валидных событий; breaking change = 0 | Reject produce/merge, откат схемы, алерт владельцу домена | Доменная команда-продюсер + platform |
+| Completeness | Обязательные бизнес-поля не пусты: `booking_id`, `event_id`, `occurred_at`, `region_id`, суммы/валюта для Payments | Great Expectations/dbt tests, Flink validation | ≥ 99,9% для operational events; 100% для Payments/Payouts critical fields | Невалидные записи в quarantine, алерт, replay после исправления | Доменная команда + data engineers |
+| Uniqueness | Нет дублей `event_id`; idempotency keys уникальны в окне | Flink dedup state, ClickHouse/dbt uniqueness tests | Дубли сверх ожидаемых retry ≤ 0,1%; для payment idempotency конфликт = 0 | Dedup, quarantine конфликтов, incident для Payments | Data engineers; Payments owner для money flows |
+| Validity | Значения в допустимых диапазонах: координаты, `geo_cell`, цены > 0, currency ISO, `surge_multiplier` в policy | Great Expectations, custom Flink rules | Нарушения ≤ 0,1%; финансовые суммы/currency = 0 нарушений | Quarantine, DLQ события правил, rollback/replay producer fix | Data engineers + доменный owner |
+| Consistency | Согласованность статусов Saga, price/payment amounts, region/tenant, `ride_region` в событиях одной поездки | Flink joins, dbt tests, reconciliation jobs | Несогласованные ключевые факты = 0 для Booking/Payments; ≤ 0,1% для аналитики | Stop affected mart, алерт, reconciliation, replay | Booking/Payments/Pricing owners + data engineers |
+| Timeliness/Freshness | Лаг event time → curated/BI/Feature Store; watermark lag; batch completion time | Prometheus/Grafana, Flink metrics, freshness checks | Tier-1 online features p95 ≤ 2 мин; regional BI ≤ 5 мин; global BI ≤ 30 мин | Alertmanager, autoscale/restart job, mark dashboard stale | Data engineers + SRE |
+| Referential integrity | `booking_id`, `driver_id`, `payment_id`, `tenant_id` существуют в допустимых источниках/справочниках | dbt relationships, Flink async lookup/read models | Orphan records ≤ 0,1%; Payments orphans = 0 | Quarantine orphans, backfill lookup, replay after source fix | Data engineers + source domain |
+| Distribution drift | PSI/KS/mean/std drift для ML features и BI ключевых метрик по региону/тенанту | Feature Store monitoring, Evidently/custom jobs, Grafana | Warning PSI > 0,1; critical PSI > 0,25 или domain-specific threshold | Алерт, freeze promotion, retraining/recalibration, data incident review | ML/data owners + Pricing/Fraud teams |
+
+Quality score витрины рассчитывается как взвешенная сводка этих измерений
+с учётом критичности dataset. Dataset с score ниже порога не публикуется в
+serving layer для DataLens/ML либо помечается как stale/degraded.
 
 ### 1. Schema Registry как обязательный контракт
 
@@ -59,9 +83,21 @@
   структурную совместимость, но не смысл поля, не гарантии свежести/полноты
   и не то, что произойдёт при депрекации поля. Data contract — явное
   соглашение (владелец, семантика полей, гарантии по свежести/полноте,
+  privacy classification, lineage, допустимые consumers, SLA витрин,
   политика изменения/депрекации) между доменной командой-продюсером и
   data-инженерами — закрывает разрыв, который остаётся, даже если схема
   формально валидна, но её смысл трактуется по-разному двумя сторонами.
+
+Минимальный data contract включает:
+
+- owner доменного события/CDC-источника и owner downstream dataset;
+- схему, версию, compatibility mode и ссылку на Schema Registry subject;
+- business semantics каждого поля и допустимые значения;
+- freshness SLA, completeness target и правила поздних событий;
+- privacy classification: raw, pseudonymized, anonymized, sensitive PII,
+  precise geolocation, payment reference;
+- правила masking/pseudonymization/anonymization;
+- contract tests в CI, план депрекации и replay/backfill instructions.
 
 ### 3. Валидация в пайплайне (Great Expectations / dbt tests)
 
@@ -97,6 +133,19 @@
   проблему в retry-логике продюсера, [Task2/05-delivery-guarantees.md](../Task2/05-delivery-guarantees.md)).
   Алерты — через существующий Alertmanager.
 
+Для ключевых витрин фиксируются SLA:
+
+- online Feature Store для Pricing/Fraud: freshness p95 ≤ 2 минуты,
+  availability не ниже Tier-1 зависимости соответствующего региона;
+- региональные operational BI views: freshness p95 ≤ 5 минут;
+- глобальные anonymized BI views в `core`: freshness p95 ≤ 30 минут;
+- financial reconciliation marts: закрытие daily batch до T+1 06:00
+  локального времени региона.
+
+Алерты срабатывают на freshness breach, рост quarantine/DLQ, падение
+quality score, drift critical threshold, lineage gap и отсутствие данных
+от критичного producer.
+
 ### 5. Карантинная зона для невалидных записей
 
 - **Этап пайплайна**: параллельный путь сразу после валидации (п. 3) —
@@ -112,6 +161,14 @@
   разбора и последующей переобработки после исправления причины (в коде
   продюсера, в правиле валидации, и т. п.), не жертвуя ни целостностью
   учёта, ни доступностью пайплайна.
+
+Quarantine хранит исходную запись, причину отказа, версию схемы, job
+version, validation rule id, `event_id`, `correlation_id`, `region_id` и
+dataset owner. После исправления причины данные переобрабатываются через
+контролируемый replay из Kafka/Data Lake с теми же idempotency rules, что
+и обычный пайплайн. Если запись не может быть исправлена автоматически,
+она остаётся в ручной очереди разбора; удаление из quarantine без решения
+владельца запрещено.
 
 ### 6. Data lineage (OpenLineage)
 
@@ -130,6 +187,11 @@
   аудита доступа/обработки персональных данных
   ([Task3/05-compliance.md](../Task3/05-compliance.md)).
 
+Lineage публикуется в data catalog вместе с dataset ownership, privacy
+classification, retention class, quality score, SLA и ссылкой на data
+contract. Это позволяет DataLens, ML Training и downstream jobs выбирать
+только curated/serving datasets, а не случайно читать raw restricted zone.
+
 ### 7. Мониторинг дрейфа данных для ML-моделей
 
 - **Этап пайплайна**: на границе Feature Store ↔ Model Serving и в цикле
@@ -145,6 +207,28 @@
   "данные корректны, но статистически другие, чем модель видела при
   обучении", и служит триггером для переобучения через петлю обратной
   связи ([01-data-pipeline.md](01-data-pipeline.md)).
+
+Для ML дополнительно обязательны:
+
+- **training-serving skew protection**: одно определение признака для
+  offline/online, автоматические parity tests и сравнение sample outputs;
+- **feature freshness**: SLA по каждому online feature, stale features
+  исключаются или приводят к fallback модели/правилу;
+- **feature lineage**: связь feature → source event/CDC → transform code
+  → dataset snapshot;
+- **drift monitoring**: population/data drift по region/tenant/model
+  segment, отдельные thresholds для Pricing и Fraud;
+- **model/data versioning**: каждая prediction содержит `model_version`,
+  `feature_set_version`, training dataset snapshot и transform version.
+
+### 8. Curated serving layer для BI
+
+DataLens читает только curated/serving layer: regional pseudonymized views
+для ограниченной операционной аналитики и anonymized aggregated views для
+глобального BI. Прямой доступ DataLens к raw Kafka topics, raw Data Lake,
+PII mapping/vault и точным GPS-таблицам запрещён на уровне IAM и data
+catalog policy. Если витрина не прошла quality threshold или privacy
+classification, она не публикуется в BI workspace.
 
 ## Альтернативы
 
@@ -169,6 +253,10 @@
   дождаться фактического результата поездки/платежа); мониторинг дрейфа
   признаков даёт более раннее предупреждение, до того как деградация
   проявится в бизнес-метриках.
+- **Разрешить BI читать raw Data Lake/Kafka напрямую, полагаясь на права
+  пользователей.** Отклонено: это обходит privacy transformations,
+  quality gates, lineage и data catalog. BI должен работать с curated
+  serving layer.
 
 ## Компромиссы и риски
 

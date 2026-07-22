@@ -2,10 +2,14 @@
 !include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Deployment.puml
 
 LAYOUT_WITH_LEGEND()
+UpdateElementStyle("new", $bgColor="red", $fontColor="white")
+UpdateRelStyle("new", $textColor="red", $lineColor="red")
 
-title Схема репликации — региональный шардинг + внутрирегиональная репликация по зонам
+title Схема репликации — региональный шардинг, multi-AZ HA и разрешённый DR
 
 Deployment_Node(jkt, "Регион: Джакарта (jkt)", "Индонезия, UU PDP"){
+    Container(jktFencing, "PostgreSQL Fencing / Leader Lock", "HA control", "Защита от split-brain перед promotion", $tags="new")
+    Container(jktRedis, "Redis cache", "Cache", "Не источник истины; потеря кэша допустима", $tags="new")
     Deployment_Node(jktAz1, "Зона доступности 1"){
         ContainerDb(jktPgPrimary, "Booking/Driver/Payments DB", "PostgreSQL (primary)", "Данные поездок, локаций, платежей — только этот регион")
         Container(jktKafka1, "Kafka broker", "Apache Kafka", "Реплика партиции")
@@ -21,6 +25,8 @@ Deployment_Node(jkt, "Регион: Джакарта (jkt)", "Индонезия
 }
 
 Deployment_Node(sgp, "Регион: Сингапур (sgp)", "Хаб ЮВА"){
+    Container(sgpFencing, "PostgreSQL Fencing / Leader Lock", "HA control", "Защита от split-brain перед promotion", $tags="new")
+    Container(sgpRedis, "Redis cache", "Cache", "Не источник истины; потеря кэша допустима", $tags="new")
     Deployment_Node(sgpAz1, "Зона доступности 1"){
         ContainerDb(sgpPgPrimary, "Booking/Driver/Payments DB", "PostgreSQL (primary)", "Данные поездок, локаций, платежей — только этот регион")
         Container(sgpKafka1, "Kafka broker", "Apache Kafka", "Реплика партиции")
@@ -36,6 +42,8 @@ Deployment_Node(sgp, "Регион: Сингапур (sgp)", "Хаб ЮВА"){
 }
 
 Deployment_Node(sao, "Регион: Сан-Паулу (sao)", "Бразилия, LGPD"){
+    Container(saoFencing, "PostgreSQL Fencing / Leader Lock", "HA control", "Защита от split-brain перед promotion", $tags="new")
+    Container(saoRedis, "Redis cache", "Cache", "Не источник истины; потеря кэша допустима", $tags="new")
     Deployment_Node(saoAz1, "Зона доступности 1"){
         ContainerDb(saoPgPrimary, "Booking/Driver/Payments DB", "PostgreSQL (primary)", "Данные поездок, локаций, платежей — только этот регион")
         Container(saoKafka1, "Kafka broker", "Apache Kafka", "Реплика партиции")
@@ -52,33 +60,57 @@ Deployment_Node(sao, "Регион: Сан-Паулу (sao)", "Бразилия,
 
 Deployment_Node(core, "Домашний регион (core)", "Yandex Cloud"){
     Container(adminPanel, "Админ-панель", "Web", "Управление платформой")
-    ContainerDb(globalRefStore, "Global Reference Store", "PostgreSQL", "Справочники, конфигурация, тонкий IAM-индекс (глобальный ID + домашний регион), Schema Registry")
+    ContainerDb(globalRefStore, "Global Reference Store", "PostgreSQL", "Справочники, конфигурация, тонкий IAM-индекс (глобальный ID + profile_region), Schema Registry", $tags="new")
 }
 
-Rel(jktPgPrimary, jktPgStandby1, "Синхронная репликация")
-Rel(jktPgPrimary, jktPgStandby2, "Синхронная репликация")
-Rel(sgpPgPrimary, sgpPgStandby1, "Синхронная репликация")
-Rel(sgpPgPrimary, sgpPgStandby2, "Синхронная репликация")
-Rel(saoPgPrimary, saoPgStandby1, "Синхронная репликация")
-Rel(saoPgPrimary, saoPgStandby2, "Синхронная репликация")
+Deployment_Node(drLegalZone, "DR standby внутри той же юридической зоны", "per production region", $tags="new"){
+    ContainerDb(drPg, "DR PostgreSQL replica", "Async standby", "Только разрешённые данные; целевой lag <=5 мин", $tags="new")
+    Container(drKafka, "DR Kafka cluster", "Apache Kafka", "MirrorMaker 2 / аналог; целевой lag <=5 мин", $tags="new")
+}
 
-Rel(jktKafka1, jktKafka2, "RF=3, реплика партиции по зонам")
-Rel(jktKafka1, jktKafka3, "RF=3, реплика партиции по зонам")
-Rel(sgpKafka1, sgpKafka2, "RF=3, реплика партиции по зонам")
-Rel(sgpKafka1, sgpKafka3, "RF=3, реплика партиции по зонам")
-Rel(saoKafka1, saoKafka2, "RF=3, реплика партиции по зонам")
-Rel(saoKafka1, saoKafka3, "RF=3, реплика партиции по зонам")
+Rel(jktPgPrimary, jktPgStandby1, "Sync/Semisync replication", "RPO 0 или <=1 мин", $tags="new")
+Rel(jktPgPrimary, jktPgStandby2, "Sync/Semisync replication", "RPO 0 или <=1 мин", $tags="new")
+Rel(sgpPgPrimary, sgpPgStandby1, "Sync/Semisync replication", "RPO 0 или <=1 мин", $tags="new")
+Rel(sgpPgPrimary, sgpPgStandby2, "Sync/Semisync replication", "RPO 0 или <=1 мин", $tags="new")
+Rel(saoPgPrimary, saoPgStandby1, "Sync/Semisync replication", "RPO 0 или <=1 мин", $tags="new")
+Rel(saoPgPrimary, saoPgStandby2, "Sync/Semisync replication", "RPO 0 или <=1 мин", $tags="new")
+
+Rel(jktFencing, jktPgPrimary, "Fencing старого primary перед promotion", $tags="new")
+Rel(sgpFencing, sgpPgPrimary, "Fencing старого primary перед promotion", $tags="new")
+Rel(saoFencing, saoPgPrimary, "Fencing старого primary перед promotion", $tags="new")
+
+Rel(jktKafka1, jktKafka2, "RF>=3, min.insync.replicas>=2", "acks=all", $tags="new")
+Rel(jktKafka1, jktKafka3, "RF>=3, min.insync.replicas>=2", "acks=all", $tags="new")
+Rel(sgpKafka1, sgpKafka2, "RF>=3, min.insync.replicas>=2", "acks=all", $tags="new")
+Rel(sgpKafka1, sgpKafka3, "RF>=3, min.insync.replicas>=2", "acks=all", $tags="new")
+Rel(saoKafka1, saoKafka2, "RF>=3, min.insync.replicas>=2", "acks=all", $tags="new")
+Rel(saoKafka1, saoKafka3, "RF>=3, min.insync.replicas>=2", "acks=all", $tags="new")
 
 Rel(globalRefStore, jktPgPrimary, "Асинхронная репликация: справочники, конфигурация, IAM-индекс", "eventual consistency")
 Rel(globalRefStore, sgpPgPrimary, "Асинхронная репликация: справочники, конфигурация, IAM-индекс", "eventual consistency")
 Rel(globalRefStore, saoPgPrimary, "Асинхронная репликация: справочники, конфигурация, IAM-индекс", "eventual consistency")
 
-note right of globalRefStore
+Rel(jktPgPrimary, drPg, "Async DR replication: только разрешённые данные", "RPO = lag", $tags="new")
+Rel(jktKafka1, drKafka, "MirrorMaker 2 / аналог: разрешённые потоки", "RPO = lag", $tags="new")
+Rel(sgpPgPrimary, drPg, "Async DR replication: только разрешённые данные", "RPO = lag", $tags="new")
+Rel(sgpKafka1, drKafka, "MirrorMaker 2 / аналог: разрешённые потоки", "RPO = lag", $tags="new")
+Rel(saoPgPrimary, drPg, "Async DR replication: только разрешённые данные", "RPO = lag", $tags="new")
+Rel(saoKafka1, drKafka, "MirrorMaker 2 / аналог: разрешённые потоки", "RPO = lag", $tags="new")
+
+note right of globalRefStore #FFCCCC
   Данные поездок, локаций и платежей
   НЕ реплицируются глобально —
-  региональный шардинг (см. 02-replication.md).
+  они живут в ride_region.
   Глобально реплицируются только
-  справочники/конфигурация/тонкий IAM-индекс.
+  справочники/конфигурация/тонкий IAM-индекс
+  с profile_region, а не home_region.
+  Cross-region async replication имеет
+  RPO по lag, а не RPO 0.
 end note
+
+legend right
+  |Цвет|Значение|
+  |<back:red><color:white>Красный</color></back>|Новые или изменённые элементы Task3: 99,99% HA/DR, fencing, Redis cache-only, MirrorMaker 2|
+endlegend
 
 @enduml

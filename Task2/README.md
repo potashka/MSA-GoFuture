@@ -13,12 +13,12 @@
 | Файл | Описание |
 |---|---|
 | [01-domain-events.md](01-domain-events.md) | Каталог из 16 доменных событий (ADR): продюсер, потребители, ключевые поля схемы, ключ партиционирования, semantics (fact/command), retention для каждого события. |
-| [02-kafka-topics.md](02-kafka-topics.md) | ADR о схеме топиков Kafka: нейминг `{region}.{domain}.{event}`, региональная изоляция как первый уровень партиционирования, ключи партиций, число партиций/replication factor/retention по группам топиков, отдельная схема для высокочастотного `driver.location.updated`, Schema Registry (Avro, BACKWARD compatibility). |
+| [02-kafka-topics.md](02-kafka-topics.md) | ADR о схеме топиков Kafka: нейминг `{region}.{domain}.{event}`, региональная изоляция как первый уровень партиционирования, ключи партиций, настраиваемые параметры партиций/replication factor/retention по группам топиков, отдельная схема для высокочастотного `driver.location.updated`, Schema Registry (Avro, BACKWARD compatibility). |
 | [03-stream-processing.md](03-stream-processing.md) | ADR о выборе инструментов потоковой обработки: Flink — для оконных агрегаций спроса/предложения (surge) и "умного" перераспределения водителей; Kafka Streams — для простых проекций и обогащения внутри сервисов. |
-| [04-saga.md](04-saga.md) | ADR о выборе оркестрации (Booking Service как оркестратор) для саги бронирования поездки: полная последовательность happy path и таблица компенсирующих действий для отказа каждого шага (fraud check, pricing, driver matching, payment authorization). |
+| [04-saga.md](04-saga.md) | ADR о выборе асинхронной оркестрируемой Saga: Booking Service хранит состояние, отправляет Kafka-команды, а переходы выполняются только по событиям результата; включает state machine, таймауты, retry, DLQ и компенсации. |
 | [05-delivery-guarantees.md](05-delivery-guarantees.md) | ADR о надёжной доставке: transactional outbox у всех продюсеров, at-least-once + идемпотентные консьюмеры (dedup по `event_id`), DLQ с алертами, retry с exponential backoff, эволюция схем через Schema Registry. |
-| [06-monitoring.md](06-monitoring.md) | ADR о подходе к мониторингу: расширение существующего стека (Prometheus/Grafana/Loki/Alertmanager) экспортёром Kafka, OpenTelemetry Collector и Tempo; список метрик (RED, consumer lag, DLQ, latency саги, пропускная способность топиков, трейсинг). |
-| [c2-event-platform.puml](c2-event-platform.puml) | Диаграмма контейнеров C2 (C4-PlantUML) событийной платформы: доменные сервисы, Kafka-кластер с ключевыми топиками, Schema Registry, Flink, оркестратор саги, DLQ, компоненты мониторинга. Проверена локальной компиляцией PlantUML без ошибок. |
+| [06-monitoring.md](06-monitoring.md) | ADR о подходе к observability: OpenTelemetry Collector, Prometheus, Grafana, Loki, Alertmanager, Tempo, Kafka Exporter и Flink metrics/exporter; технические метрики, бизнес-метрики, SLI/SLO, алерты и trace attributes. |
+| [c2-event-platform.puml](c2-event-platform.puml) | Диаграмма контейнеров C2 (C4-PlantUML) событийной платформы: доменные сервисы, Kafka-кластер с ключевыми топиками, Schema Registry, Flink, оркестратор саги, DLQ, компоненты мониторинга. |
 
 ## Как читать
 
@@ -45,5 +45,6 @@
 
 ## Скриншоты диаграмм
 
-Готовый PNG-рендер [c2-event-platform.puml](c2-event-platform.puml) — в
-[../renders/Task2/](../renders/Task2/).
+PNG-рендер [c2-event-platform.puml](c2-event-platform.puml) должен лежать в
+[../renders/Task2/](../renders/Task2/) и обновляться после изменения
+PlantUML-исходника.

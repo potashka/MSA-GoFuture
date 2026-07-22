@@ -9,12 +9,12 @@
 DLQ, Schema Registry — см. [c2-event-platform.puml](c2-event-platform.puml))
 вносит классы отказов, не покрываемые типовым мониторингом монолита:
 отставание потребителей (consumer lag), накопление необработанных
-сообщений (DLQ), деградацию сквозной латентности многошаговой саги
-([04-saga.md](04-saga.md)). У компании уже есть эксплуатируемый стек
-наблюдаемости — Prometheus, Grafana, Loki, Alertmanager (см.
-[docs/context.md](../docs/context.md)) — нужно решить, расширять ли его под
-событийную платформу или вводить отдельный стек, и зафиксировать конкретный
-набор метрик.
+сообщений (DLQ), деградацию сквозной латентности многошаговой Saga
+([04-saga.md](04-saga.md)), ошибки outbox-relay и деградацию stream
+processing. У компании уже есть эксплуатируемый стек наблюдаемости —
+Prometheus, Grafana, Loki, Alertmanager (см. [docs/context.md](../docs/context.md)).
+Нужно расширить его под событийную платформу и зафиксировать конкретный
+набор инструментов, метрик, SLI/SLO и алертов.
 
 ## Требования
 
@@ -26,132 +26,152 @@ DLQ, Schema Registry — см. [c2-event-platform.puml](c2-event-platform.puml))
   (обоснование выбора оркестрации, [04-saga.md](04-saga.md)) требует
   сквозного трейсинга через границы сервисов и Kafka, а не только точечных
   метрик по каждому сервису отдельно.
-- SRE и платформенная команда (см. [docs/context.md](../docs/context.md))
-  уже обучены существующему стеку — его следует переиспользовать, а не
-  заменять принципиально другим набором инструментов ради одной, хотя и
-  значимой, части архитектуры.
-- Отказ или деградация обработки событий (лаг, DLQ) должны обнаруживаться
-  проактивно алертом, а не постфактум по жалобам пользователей.
+- SRE и платформенная команда уже обучены существующему стеку — его
+  следует переиспользовать и расширять, а не заменять принципиально другим
+  набором инструментов ради событийной платформы.
+- Отказ или деградация обработки событий (лаг, DLQ, backpressure, stuck
+  Saga) должны обнаруживаться проактивно алертом, а не постфактум по
+  жалобам пользователей.
+- Метрики и labels не должны содержать PII: в labels допускаются
+  технические и бизнес-идентификаторы корреляции, но не телефоны, email,
+  полные координаты, платёжные реквизиты или имена пользователей.
 
 ## Решение
 
-### Расширяем существующий стек
+### Инструменты
 
-К уже эксплуатируемым Prometheus, Grafana, Loki, Alertmanager добавляются:
+Переиспользуется текущий стек Prometheus, Grafana, Loki, Alertmanager и
+добавляются компоненты, отражённые на C2-диаграмме:
 
-- **Kafka exporter** — экспортирует метрики брокеров Kafka и consumer lag
-  по группам в формате, который Prometheus уже умеет собирать (scrape).
-- **OpenTelemetry Collector** — единая точка приёма метрик и трейсов от
-  доменных сервисов, Booking-оркестратора и Flink-джобов, с последующей
-  маршрutизацией в Prometheus (метрики) и Tempo (трейсы).
-- **Tempo** — хранение и просмотр распределённых трейсов, нативно
-  интегрируется с Grafana (тот же поставщик экосистемы, что и
-  Prometheus/Loki — единый UI для метрик, логов и трейсов).
+| Инструмент | Роль |
+|---|---|
+| OpenTelemetry Collector | Принимает OTLP-метрики, логи/корреляционные атрибуты и трейсы от сервисов, Booking Saga Orchestrator и Flink jobs; маршрутизирует метрики в Prometheus, трейсы в Tempo, логи/корреляцию в Loki. |
+| Prometheus | Собирает и хранит time-series метрики сервисов, Kafka, Flink, outbox/DLQ и Saga. |
+| Grafana | Единый UI для дашбордов, алертов, логов и трейсов. |
+| Loki | Хранит структурированные логи сервисов и платформенных компонентов с корреляцией по `trace_id`, `saga_id`, `booking_id`. |
+| Alertmanager | Дедуплицирует, группирует и маршрутизирует алерты SRE/дежурным командам. |
+| Tempo | Хранит распределённые трейсы Saga и Kafka processing spans. |
+| Kafka Exporter | Экспортирует consumer lag, состояние брокеров, ISR, partitions, latency и throughput Kafka. |
+| Flink metrics/exporter | Экспортирует метрики Flink jobs: checkpoints, backpressure, watermarks, state и failures. |
 
-### Список метрик
+### Технические метрики
 
-1. **RED-метрики сервисов** (Rate, Errors, Duration) для каждого доменного
-   сервиса (Booking, Driver, Pricing, Payments, Payouts, Notification,
-   Geography, Fraud, Analytics) и платформенных компонентов (API Gateway,
-   Identity Service): запросов/сек, доля ошибок, латентность (p50/p95/p99).
-   Источник — инструментирование сервисов через OpenTelemetry SDK →
-   OTel Collector → Prometheus.
-2. **Consumer lag по группам потребления** (Kafka exporter): лаг в
-   сообщениях и во времени по каждой consumer group на каждый топик и
-   партицию (см. группы топиков в [02-kafka-topics.md](02-kafka-topics.md)).
-   Прямой индикатор того, что обработка событий отстаёт от публикации —
-   влияет и на латентность саги, и на актуальность данных (например,
-   устаревшие агрегаты `DriverLocationUpdated`, используемые для
-   surge-расчёта).
-3. **Возраст и объём DLQ** (см. [05-delivery-guarantees.md](05-delivery-guarantees.md)):
-   число сообщений в каждом `{topic}.dlq` и возраст самого старого
-   сообщения — алерт при превышении порога сигнализирует о незамеченной
-   проблеме обработки прежде, чем она превратится в заметный сбой бизнес-
-   процесса.
-4. **End-to-end latency саги** (создание заказа → назначение водителя, и
-   далее до `BookingConfirmed`): измеряется распределённым трейсингом —
-   единый `trace_id`, пробрасываемый через все шаги саги
-   ([04-saga.md](04-saga.md)), от `BookingCreated` до каждого
-   последующего шага, с разбивкой по шагам (fraud check, pricing, driver
-   matching, payment authorization) для локализации, какой именно шаг
-   деградирует.
-5. **Пропускная способность топиков**: сообщений/сек и байт/сек по каждой
-   группе топиков ([02-kafka-topics.md](02-kafka-topics.md)) — для
-   планирования ёмкости кластера и обнаружения аномалий (например,
-   внезапный всплеск `BookingCancelled` может сигнализировать об инциденте
-   в одном из сервисов, участвующих в саге).
-6. **Распределённый трейсинг OpenTelemetry**: `trace_id` и `span_id`
-   переносятся в заголовках Kafka-событий (конверт события, см.
-   [01-domain-events.md](01-domain-events.md)), связывая синхронные вызовы
-   оркестратора (шаги саги) и асинхронную публикацию/потребление событий в
-   единый трейс на протяжении всего пути конкретной поездки, независимо от
-   того, сколько сервисов и топиков она прошла.
+| Область | Метрики |
+|---|---|
+| Сервисы | RED: request rate, error rate, duration p50/p95/p99; saturation CPU/memory/thread pools; ошибки outbox relay. |
+| Kafka brokers | `under_replicated_partitions`, ISR shrink/expand rate, broker disk usage, offline partitions, controller changes, produce latency, fetch latency, bytes/messages in/out. |
+| Kafka consumers | consumer lag в сообщениях и времени по topic/partition/group, rebalance count, commit latency, failed deserialization count. |
+| Schema Registry | availability, request latency, schema compatibility failures, registry error rate. |
+| Outbox | outbox lag от записи в БД до публикации в Kafka, размер backlog, relay error rate, возраст самого старого outbox-сообщения. |
+| DLQ | DLQ growth, возраст самого старого сообщения, число сообщений по topic/group/error_class. |
+| Flink | checkpoint duration, failed checkpoints, checkpoint alignment time, backpressure, watermark lag, state size, restart count, records in/out, processing latency. |
+| DriverLocationUpdated | `deduplicated_events_total`, `stale_sequence_dropped_total`, `watermark_lag_ms`, state TTL expirations, state size по `driver_id` и `geo_cell`. |
+
+### Бизнес-метрики
+
+| Область | Метрики |
+|---|---|
+| Booking Saga | Saga duration end-to-end и по шагам, Saga timeout rate, compensation rate, stuck Saga count, число Saga по состояниям. |
+| Конверсия бронирования | `BookingCreated` → `BookingConfirmed` / `BookingCancelled`, доля отказов по `saga_step_failed`, причины отмен. |
+| Driver matching | доля `DriverReservationFailed`, время до `DriverReserved`, доля освобождений водителя после компенсации. |
+| Payments | доля `PaymentAuthorizationFailed`, время авторизации, число release/void операций, ручные проверки платежей. |
+| Surge | количество `SurgeActivated`, длительность активного surge по `geo_cell`, отклонение спрос/предложение. |
+
+### SLI/SLO
+
+| SLI | Целевой SLO |
+|---|---|
+| Доступность Kafka produce/fetch для Tier-1 топиков | Соответствует доступности Tier-1 пути создания заказа из [Task1/01-nfr.md](../Task1/01-nfr.md); плановый простой для Tier-1 не допускается. |
+| Consumer freshness для Saga-топиков | p95 задержки доставки и обработки результата шага укладывается в таймаут шага из [04-saga.md](04-saga.md). |
+| Saga completion latency | p95 happy path укладывается в бюджет П2; p99 контролируется отдельным алертом деградации. |
+| Outbox publish latency | p95 от commit локальной транзакции до публикации в Kafka не превышает операционный бюджет шага Saga. |
+| DLQ freshness | Возраст старейшего сообщения в DLQ ниже порога разбора; рост DLQ не должен оставаться без алерта. |
+| Flink freshness | Watermark lag и checkpoint duration не приводят к устаревшим `SurgeActivated`, влияющим на pricing. |
+| Schema Registry availability | Доступность достаточна для producer/consumer serializers; деградация не должна блокировать rolling deploy схем. |
+
+### Алерты
+
+| Алерт | Условие | Действие |
+|---|---|---|
+| Kafka consumer lag high | Лаг Saga или платежной consumer group выше порога по времени/сообщениям. | SRE + команда-владелец consumer group. |
+| Under-replicated partitions | `under_replicated_partitions > 0` дольше короткого окна. | SRE проверяет брокеры, ISR и диск. |
+| ISR shrink spike | Резкий рост ISR shrink rate. | SRE проверяет сетевые/дисковые деградации брокеров. |
+| Broker disk high | Broker disk usage выше порога. | SRE включает capacity/runbook, проверяет retention и tiered storage. |
+| Produce/fetch latency high | p95/p99 produce или fetch latency выше SLO. | SRE + платформенная команда. |
+| Consumer rebalance storm | Rebalance count выше нормы. | Команда consumer group проверяет autoscaling, max.poll и deploy. |
+| Flink checkpoints failing | Failed checkpoints или checkpoint duration выше SLO. | Data/platform team проверяет state backend и backpressure. |
+| Flink backpressure high | Backpressure держится выше порога. | Масштабирование job или расследование downstream. |
+| Watermark lag high | Watermark lag влияет на freshness surge. | Pricing/Data team проверяет задержки input и watermark strategy. |
+| Outbox lag high | Возраст старого outbox-сообщения выше бюджета. | Команда сервиса и SRE проверяют relay/CDC. |
+| DLQ growth | DLQ растёт или старейшее сообщение старше порога. | Владелец consumer group разбирает poison messages. |
+| Saga timeout rate high | Доля `SagaStepTimedOut` выше baseline. | Booking team и владелец деградирующего шага. |
+| Compensation rate high | Компенсации растут выше baseline. | Booking/Driver/Payments triage. |
+| Stuck Saga count high | `STUCK_REQUIRES_MANUAL_RESOLUTION` выше порога. | Операторы и доменная команда разбирают вручную. |
+| Schema Registry unavailable | Ошибки availability/latency или рост compatibility failures. | Платформенная команда. |
+
+### Трейсинг и labels
+
+Базовые trace attributes для Saga и Kafka processing:
+
+- `trace_id`;
+- `saga_id`;
+- `booking_id`;
+- `region_id`;
+- `tenant_id`, если включена мультитенантность;
+- `event_type`, `event_id`, `correlation_id`, `causation_id`;
+- `kafka.topic`, `kafka.partition`, `kafka.offset`, `consumer_group`.
+
+PII не помещается в labels и trace attributes высокой кардинальности:
+нельзя писать телефон, email, имя, точный адрес, полные координаты,
+платёжные реквизиты или содержимое уведомлений. Для поиска инцидентов
+используются `booking_id`, `saga_id`, `trace_id`, `region_id` и
+`tenant_id`.
 
 ### Обоснование расширения существующего стека вместо замены
 
 - Prometheus/Grafana/Loki/Alertmanager уже эксплуатируются SRE и знакомы
-  командам (см. [docs/context.md](../docs/context.md)); замена
-  потребовала бы параллельной миграции дашбордов и алертов в разгар
-  декомпозиции монолита, отвлекая ресурсы от основной задачи миграции.
-- Kafka exporter, OpenTelemetry Collector и Tempo нативно совместимы с
-  существующим стеком: Kafka exporter отдаёт метрики в формате, который
-  Prometheus просто добавляет к уже существующим scrape-таргетам; Tempo —
-  тот же экосистемный поставщик, что Prometheus и Loki, с единым UI в
-  Grafana для метрик, логов и трейсов одновременно — расширение, а не
-  параллельная независимая система.
+  командам; замена потребовала бы параллельной миграции дашбордов и
+  алертов в разгар декомпозиции монолита.
+- Kafka Exporter, Flink metrics/exporter, OpenTelemetry Collector и Tempo
+  нативно совместимы с текущим стеком и дают единый UI в Grafana для
+  метрик, логов и трейсов.
 - MTTR < 1 часа (Э1) требует единого места диагностики: отдельный,
-  несовместимый стек трейсинга под событийную платформу заставил бы
-  дежурного инженера переключаться между системами при инциденте,
-  затрудняя, а не ускоряя реакцию.
-- OpenTelemetry — открытый, не привязанный к конкретному вендору стандарт
-  инструментирования: можно начать с Tempo как backend'а трейсов и сменить
-  его в будущем без переинструментирования кода сервисов — снижает риск
-  привязки к одному поставщику при развитии платформы.
+  несовместимый стек трейсинга под событийную платформу увеличил бы время
+  переключения контекста при инциденте.
 
 ## Альтернативы
 
-- **Отдельный специализированный APM/мониторинг под событийную
-  платформу** (вендорское решение для Kafka/потоковой обработки, не
-  интегрированное с текущим стеком). Отклонено: создаёт второй независимый
-  источник истины для инцидентов, увеличивает MTTR из-за переключения
-  контекста при разборе инцидента, не переиспользует уже настроенные
+- **Отдельный специализированный APM/мониторинг под событийную платформу**
+  (вендорское решение для Kafka/потоковой обработки, не интегрированное с
+  текущим стеком). Отклонено: создаёт второй независимый источник истины
+  для инцидентов, увеличивает MTTR и не переиспользует уже настроенные
   дашборды и алерты Grafana/Alertmanager.
 - **Трейсинг только через логи (Loki), без выделенного backend'а трейсов
-  (Tempo).** Отклонено: без модели трейсов со спанами невозможно наглядно
-  визуализировать сквозную латентность саги по шагам — поиск по логам не
-  даёт дерева вызовов через пять и более сервисов и Kafka, необходимого
-  для локализации деградирующего шага.
-- **Инструментирование трейсинга вручную под конкретный backend (например,
-  клиент Jaeger напрямую в каждом сервисе), без OpenTelemetry Collector.**
-  Отклонено: OpenTelemetry Collector даёт единый пайплайн сбора и для
-  метрик, и для трейсов с возможностью сменить backend в будущем без
-  переинструментирования кода сервисов.
+  (Tempo).** Отклонено: без модели трейсов со spans невозможно наглядно
+  визуализировать сквозную латентность Saga по шагам.
+- **Инструментирование трейсинга вручную под конкретный backend, без
+  OpenTelemetry Collector.** Отклонено: OTel Collector даёт единый pipeline
+  сбора для метрик и трейсов и позволяет менять backend без
+  переинструментирования сервисов.
 
 ## Компромиссы и риски
 
-- Kafka exporter и OTel Collector — новые компоненты, требующие
-  собственного развёртывания и мониторинга их доступности ("кто мониторит
-  мониторинг") — должны быть включены в стандартный процесс деплоя
-  (Kubernetes) и покрыты базовыми алертами доступности наравне с прочими
-  компонентами платформы.
-- Полный сквозной трейсинг через оркестратор, Kafka и 9 доменных сервисов
-  в масштабе 500 тыс. конкурентных поездок создаёт большой объём
-  трейсинг-данных — обязательна политика сэмплирования (например, 100%
-  для ошибок и аномально долгих трейсов, частичное сэмплирование для
-  happy path), иначе объём данных в Tempo станет неуправляемым.
+- Kafka Exporter, Flink metrics/exporter и OTel Collector требуют
+  собственного деплоя и мониторинга доступности ("кто мониторит
+  мониторинг"). Они должны быть включены в стандартный процесс деплоя и
+  покрыты базовыми алертами.
+- Полный сквозной трейсинг через оркестратор, Kafka и доменные сервисы в
+  масштабе 500 тыс. конкурентных поездок создаёт большой объём данных —
+  нужна политика sampling: 100% для ошибок, таймаутов и stuck Saga,
+  частичный sampling для happy path.
 - Consumer lag — необходимый, но не достаточный сигнал: низкий лаг не
-  гарантирует корректность обработки (например, при "тихом" пропуске
-  сообщений из-за ошибки в логике потребителя) — должен дополняться
-  сверкой на уровне бизнес-метрик (например, сопоставление количества
-  `BookingCreated` и `BookingConfirmed`/`BookingCancelled` за период,
-  обнаруживающее "потерянные" заказы, которые не пришли ни к одному из
-  терминальных состояний).
+  гарантирует корректность обработки. Он дополняется бизнес-сверкой
+  количества `BookingCreated`, `BookingConfirmed`, `BookingCancelled` и
+  числом stuck Saga.
 - Региональная изоляция Kafka-кластеров ([02-kafka-topics.md](02-kafka-topics.md))
-  означает, что мониторинг тоже частично региональный — требуется
-  федерация метрик (например, `remote_write` из региональных Prometheus в
-  центральное хранилище) для единого глобального обзора в Grafana; это
-  нужно спроектировать отдельно и не считается решённым автоматически
-  фактом расширения стека.
+  означает, что мониторинг тоже частично региональный. Требуется федерация
+  метрик или `remote_write` из региональных Prometheus для глобального
+  обзора в Grafana.
 
 ## Статус
 

@@ -16,21 +16,24 @@ System_Boundary(platform, "GoFuture Multi-Tenant Platform") {
 
     Container(gateway, "API Gateway", "Kubernetes Ingress / Gateway", "Маршрутизация; квоты и rate limiting на тенанта")
 
-    Container(keycloak, "Keycloak", "IAM", "Platform realm + realm на каждого тенанта; SSO через OIDC/SAML")
+    Container(keycloak, "Keycloak", "IAM", "Platform realm + realm на каждого тенанта; claims tenant_id/profile_region/roles/scopes")
+    Container(breakGlass, "Support Elevation / Break-glass", "IAM workflow", "MFA, ticket/reason, time-bound tenant scope, audit")
 
     Container(pricingSvc, "Pricing Service", "Domain Service", "Тенант-специфичные тарифы")
     Container(bookingSvc, "Booking Service", "Domain Service", "Оркестратор саги; tenant_id в каждом событии")
     Container(otherServices, "Остальные доменные сервисы", "Driver, Payments, Payouts, Notification, Geography, Fraud", "Общий пул сервисов региона")
 
-    ContainerDb(sharedDb, "Сервисные БД (pool)", "PostgreSQL + RLS по tenant_id", "Общие таблицы для pool-тенантов")
+    ContainerDb(sharedDb, "Сервисные БД (pool)", "PostgreSQL RLS fail-closed", "ENABLE/FORCE RLS; USING + WITH CHECK по tenant_id; runtime role не owner")
     ContainerDb(siloDb, "Сервисные БД/схемы (silo)", "PostgreSQL, выделенная схема/БД", "Структурно изолированные данные крупных тенантов")
 
-    Container(kafka, "Kafka (per region)", "Apache Kafka", "tenant_id в конверте каждого события; выделенные партиции/топики по тенанту")
+    Container(kafka, "Kafka shared topics (pool)", "Apache Kafka", "tenant_id в envelope; key tenant_id:business_key; quotas; отдельные consumer groups")
+    Container(kafkaDedicated, "Kafka dedicated topics / cluster", "Apache Kafka", "Dedicated tier: отдельные topics/quotas/keys; strict silo: отдельный cluster при необходимости")
+    Container(keys, "Tenant Keys", "KMS / Secrets Manager", "Отдельные encryption keys для dedicated/silo tenants")
 
-    Container(otelCollector, "OpenTelemetry Collector", "OTel Collector", "Метрики/трейсы с меткой tenant_id")
-    Container(prometheus, "Prometheus", "Monitoring", "Метрики с меткой tenant_id; алерты по квотам/лимитам")
-    Container(grafana, "Grafana", "Dashboards", "Дашборды, параметризованные tenant_id")
-    Container(alertmanager, "Alertmanager", "Alerting", "Алерты по превышению квот, аномалиям тенанта")
+    Container(otelCollector, "OpenTelemetry Collector", "OTel Collector", "Метрики/трейсы без PII; tenant_tier baseline, tenant_id только limited drill-down")
+    Container(prometheus, "Prometheus", "Monitoring", "Метрики по tenant_tier/region/service/topic; алерты по квотам/лимитам")
+    Container(grafana, "Grafana", "Dashboards", "Дашборды по tenant tier и ограниченный tenant drill-down")
+    Container(alertmanager, "Alertmanager", "Alerting", "Алерты по превышению квот, noisy neighbor, isolation failures")
 }
 
 Rel(tenantAdmin, partnerIdp, "Аутентификация в корпоративном IdP")
@@ -39,9 +42,10 @@ Rel(partnerIdp, keycloak, "Федерация identity provider (realm тена�
 Rel(driverUser, gateway, "Запросы", "HTTPS")
 Rel(passenger, gateway, "Запросы", "HTTPS")
 Rel(tenantAdmin, gateway, "Запросы администрирования", "HTTPS")
-Rel(platformSupport, gateway, "Диагностика (все тенанты, ограниченно)", "HTTPS")
+Rel(platformSupport, breakGlass, "Запрашивает временный доступ", "MFA + ticket")
+Rel(breakGlass, gateway, "Выдаёт scoped tenant elevation", "time-bound JWT")
 
-Rel(gateway, keycloak, "Проверка токена (tenant_id, home_region, роль)", "mTLS, JWT")
+Rel(gateway, keycloak, "Проверка токена (tenant_id, profile_region, roles/scopes)", "mTLS, JWT")
 Rel(gateway, bookingSvc, "Маршрутизация с учётом квот/rate limit тенанта", "gRPC, mTLS")
 Rel(gateway, pricingSvc, "Маршрутизация с учётом квот/rate limit тенанта", "gRPC, mTLS")
 Rel(gateway, otherServices, "Маршрутизация с учётом квот/rate limit тенанта", "gRPC, mTLS")
@@ -53,18 +57,20 @@ Rel(otherServices, sharedDb, "Читает/пишет (pool, RLS по tenant_id)
 Rel(bookingSvc, siloDb, "Читает/пишет (silo-тенанты)", "SQL")
 Rel(pricingSvc, siloDb, "Читает/пишет (silo-тенанты)", "SQL")
 
-Rel(bookingSvc, kafka, "Публикует события с tenant_id")
-Rel(pricingSvc, kafka, "Публикует события с tenant_id")
-Rel(otherServices, kafka, "Публикует/потребляет события с tenant_id")
+Rel(bookingSvc, kafka, "Pool: key tenant_id:booking_id; producer tenant check")
+Rel(pricingSvc, kafka, "Pool: key tenant_id:business_key; quotas")
+Rel(otherServices, kafka, "Pool: tenant-aware produce/consume; separate consumer groups")
+Rel(bookingSvc, kafkaDedicated, "Dedicated/silo tenants: выделенные topics/cluster")
+Rel(kafkaDedicated, keys, "Использует отдельные encryption keys")
 
-Rel(gateway, otelCollector, "Отправляет метрики/трейсы (с меткой tenant_id)", "OTLP")
-Rel(bookingSvc, otelCollector, "Отправляет метрики/трейсы (с меткой tenant_id)", "OTLP")
-Rel(pricingSvc, otelCollector, "Отправляет метрики/трейсы (с меткой tenant_id)", "OTLP")
-Rel(otherServices, otelCollector, "Отправляет метрики/трейсы (с меткой tenant_id)", "OTLP")
+Rel(gateway, otelCollector, "Отправляет метрики/трейсы (tenant_tier, no PII labels)", "OTLP")
+Rel(bookingSvc, otelCollector, "Отправляет метрики/трейсы (tenant_tier, no PII labels)", "OTLP")
+Rel(pricingSvc, otelCollector, "Отправляет метрики/трейсы (tenant_tier, no PII labels)", "OTLP")
+Rel(otherServices, otelCollector, "Отправляет метрики/трейсы (tenant_tier, no PII labels)", "OTLP")
 
 Rel(otelCollector, prometheus, "Экспортирует метрики", "remote_write")
-Rel(prometheus, alertmanager, "Алерты по превышению квот/аномалиям tenant_id")
-Rel(grafana, prometheus, "Запросы метрик (фильтр по tenant_id)", "PromQL")
+Rel(prometheus, alertmanager, "Алерты по превышению квот/noisy neighbor/isolation failures")
+Rel(grafana, prometheus, "Запросы метрик (tenant_tier + limited tenant drill-down)", "PromQL")
 
 note right of gateway
   Квоты и rate limiting настраиваются
@@ -74,9 +80,23 @@ note right of gateway
 end note
 
 note right of sharedDb
-  RLS-политика: USING (tenant_id =
-  current_setting('app.tenant_id'))
-  на каждой тенант-специфичной таблице.
+  RLS fail-closed:
+  ENABLE + FORCE RLS,
+  USING и WITH CHECK по
+  current_setting('app.tenant_id', true).
+  Без SET LOCAL внутри транзакции
+  доступ запрещается.
+  Runtime role: не superuser,
+  не BYPASSRLS, не owner.
+end note
+
+note right of kafka
+  Pool tenants используют shared topics.
+  Изоляция: tenant_id в envelope,
+  key = tenant_id:business_key,
+  quotas, consumer groups и проверки
+  producer/consumer tenant context.
+  Partition-level ACL не обещается.
 end note
 
 @enduml

@@ -17,11 +17,17 @@ System_Boundary(platform, "GoFuture Data & ML Platform") {
     Container(kafka, "Kafka (per region)", "Apache Kafka", "Региональные кластеры доменных событий")
     Container(cdc, "CDC Connector", "Debezium", "Захват изменений сущностей, не покрытых доменными событиями")
 
+    Container(dataContracts, "Data Contracts + Schema Registry", "Avro / CI checks", "Схемы, владельцы, privacy classification, SLA и contract tests")
     Container(flink, "Flink Pipeline (per region)", "Apache Flink", "Валидация, обогащение, признаки в реальном времени")
-    Container(anonExport, "Anonymization / Aggregation Export", "Flink job", "Отделяет агрегированные/анонимизированные данные для кросс-регионального экспорта")
+    Container(qualityGate, "Data Quality Gate", "Great Expectations / dbt / Flink rules", "Schema, completeness, uniqueness, validity, consistency, freshness, referential integrity, drift")
+    Container(quarantine, "Quarantine / DLQ", "Data Lake area + Kafka DLQ", "Невалидные записи, причины отказа, replay после исправления")
+    Container(lineageCatalog, "Data Catalog + Lineage", "OpenLineage / Catalog", "Ownership, privacy class, quality score, SLA, lineage")
+    Container(privacyTransform, "Privacy Transform", "Flink/Spark job", "HMAC/tokenization, pseudonymization, aggregation, suppression")
+    ContainerDb(piiVault, "PII Mapping Vault", "Access-controlled store", "Mapping исходных ID к pseudonymous IDs; ключи отдельно в Secrets/KMS")
 
-    ContainerDb(clickhouseRegional, "ClickHouse (регион)", "ClickHouse", "Реалтайм-витрины региона")
-    ContainerDb(datalakeRegional, "Data Lake (регион)", "S3-compatible object storage", "Сырые события, партиционирование по региону/дате")
+    ContainerDb(rawZone, "Raw Restricted Zone (per region)", "S3/ClickHouse restricted", "Raw Kafka/CDC, PII, точная геолокация; доступ ограничен")
+    ContainerDb(curatedRegional, "Curated Data (per region)", "ClickHouse/Data Lake", "Pseudonymized operational analytics и feature datasets")
+    ContainerDb(anonymizedViews, "Anonymized BI Views", "ClickHouse serving views", "Агрегаты, coarse geo_cell, suppression редких групп")
 
     ContainerDb(clickhouseCore, "ClickHouse (core, глобальный)", "ClickHouse", "Глобальные агрегированные витрины (без PII)")
     ContainerDb(datalakeCore, "Data Lake (core, глобальный)", "S3-compatible object storage", "Глобальные анонимизированные/агрегированные исторические данные")
@@ -40,30 +46,40 @@ Rel(fraudSvc, kafka, "Публикует FraudCheckCompleted")
 Rel(otherServices, kafka, "Публикует доменные события")
 Rel(otherServices, cdc, "Источник изменений сущностей вне каталога событий", "WAL")
 
+Rel(dataContracts, kafka, "Schema validity и compatibility до produce")
 Rel(kafka, flink, "Потребляет доменные события")
 Rel(cdc, flink, "Публикует CDC-изменения")
 
-Rel(flink, clickhouseRegional, "Пишет реалтайм-витрины")
-Rel(flink, datalakeRegional, "Пишет сырые валидированные события")
+Rel(flink, qualityGate, "Проверяет data quality")
+Rel(qualityGate, quarantine, "Отправляет невалидные записи")
+Rel(quarantine, flink, "Replay после исправления причины")
+Rel(qualityGate, rawZone, "Пишет валидированные raw records")
+Rel(qualityGate, privacyTransform, "Передаёт валидированные данные")
+Rel(privacyTransform, piiVault, "Читает/пишет mapping ограниченно")
+Rel(privacyTransform, curatedRegional, "Пишет pseudonymized operational analytics")
+Rel(privacyTransform, anonymizedViews, "Пишет anonymized aggregated BI views")
 Rel(flink, featureStore, "Публикует онлайн-признаки")
-Rel(flink, anonExport, "Передаёт данные для анонимизации/агрегации")
 
-Rel(anonExport, clickhouseCore, "Публикует агрегированные витрины (без PII)")
-Rel(anonExport, datalakeCore, "Публикует агрегированные/анонимизированные данные (без PII)")
+Rel(anonymizedViews, clickhouseCore, "Публикует глобальные агрегированные витрины")
+Rel(anonymizedViews, datalakeCore, "Публикует anonymized aggregated datasets")
 
-Rel(datalakeRegional, featureStore, "Офлайн-признаки (в рамках региона)")
+Rel(curatedRegional, featureStore, "Офлайн-признаки (в рамках региона)")
 Rel(datalakeCore, featureStore, "Офлайн-признаки (глобальные, агрегированные)")
 
 Rel(featureStore, mlTraining, "Офлайн-признаки для обучения")
 Rel(mlTraining, modelRegistry, "Регистрирует обученные модели")
 Rel(modelRegistry, modelServing, "Продвигает модель в прод (per region)")
 Rel(featureStore, modelServing, "Онлайн-признаки для инференса")
+Rel(lineageCatalog, mlTraining, "Dataset/model lineage и версии")
+Rel(qualityGate, lineageCatalog, "Публикует quality score и validation metadata")
+Rel(privacyTransform, lineageCatalog, "Публикует lineage privacy transformations")
 
 Rel(modelServing, pricingSvc, "Предсказание: спрос/surge", "низколатентный API")
 Rel(modelServing, fraudSvc, "Предсказание: риск-скор", "низколатентный API")
 
-Rel(clickhouseRegional, dataLens, "Источник данных (региональные дашборды)")
-Rel(clickhouseCore, dataLens, "Источник данных (глобальные дашборды)")
+Rel(curatedRegional, dataLens, "Региональные curated dashboards без raw PII")
+Rel(anonymizedViews, dataLens, "BI views с anonymized aggregates")
+Rel(clickhouseCore, dataLens, "Глобальные дашборды только из агрегатов")
 Rel(dataLens, corpManager, "Отчёты и дашборды")
 Rel(dataLens, accountant, "Финансовая отчётность")
 
@@ -74,6 +90,19 @@ note right of modelServing
   события следующих шагов саги
   (см. 01-data-pipeline.md), без
   отдельного канала.
+end note
+
+note right of piiVault
+  Простое hash != anonymization.
+  Стабильная связь через HMAC/token
+  означает pseudonymization; доступ
+  к mapping/vault строго ограничен.
+end note
+
+note right of dataLens
+  DataLens не читает raw Kafka,
+  Raw Restricted Zone, PII Mapping
+  Vault или точные GPS-таблицы.
 end note
 
 @enduml

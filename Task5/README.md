@@ -12,11 +12,11 @@ Kafka-модель Task2, региональную модель и IAM/security-
 
 | Файл | Описание |
 |---|---|
-| [01-tenancy-model.md](01-tenancy-model.md) | ADR модели изоляции данных: гибрид pool (общие таблицы + PostgreSQL RLS по `tenant_id` + выделенные партиции Kafka) для стандартных партнёров и silo (отдельная схема/БД, при жёсткой регуляторике — отдельный региональный стек) для крупных; критерии выбора уровня, сравнение с чистыми pool/silo. |
-| [02-iam.md](02-iam.md) | ADR IAM-системы: Keycloak, realm на тенанта, SSO через OIDC/SAML с корпоративными IdP партнёров, RBAC. Таблица из 9 ролей (роль/область/доступ к данным/ключевые операции). |
-| [03-onboarding.md](03-onboarding.md) | ADR автоматизированного онбординга: 9 шагов от заявки через API самообслуживания до активации, с указанием автоматизации (Terraform для одноразового провижининга, Kubernetes operator для постоянного reconciliation), целевое время 2–4 недели (pool/silo-схема) — с явной оговоркой, что silo "выделенный региональный стек" в этот срок не укладывается. |
-| [c2-multitenancy.puml](c2-multitenancy.puml) | Диаграмма контейнеров (C4): IAM (Keycloak), мониторинг с меткой `tenant_id` (Prometheus/Grafana/Alertmanager/OTel), квоты и rate limiting на API Gateway, pool/silo БД, Kafka с tenant-изоляцией. Проверена локальной компиляцией PlantUML без ошибок. |
-| [c3-onboarding.puml](c3-onboarding.puml) | Диаграмма компонентов (C4): внутреннее устройство Onboarding Service (Self-Service API, оркестратор, Terraform Runner, Tenant Operator, Smoke Test Runner) и потоки к Keycloak/БД/Kafka/Gateway/Grafana/Secrets Manager/внешним провайдерам. Проверена локальной компиляцией PlantUML без ошибок. |
+| [01-tenancy-model.md](01-tenancy-model.md) | ADR модели изоляции данных: pool (общие таблицы + PostgreSQL RLS fail-closed + shared Kafka topics с key `tenant_id:business_key`, quotas и tenant-aware producer/consumer checks), dedicated tier (выделенные topics/quotas/keys) и strict silo (отдельная схема/БД, при необходимости Kafka cluster/отдельный deployment). |
+| [02-iam.md](02-iam.md) | ADR IAM-системы: Keycloak, realm на тенанта, SSO через OIDC/SAML с корпоративными IdP партнёров, claims `tenant_id`/`profile_region`/`roles`/`scopes`, RBAC и platform support через time-bound elevation/break-glass. |
+| [03-onboarding.md](03-onboarding.md) | ADR автоматизированного онбординга: 9 шагов от заявки через API самообслуживания до активации, включая tenant, IAM realm, DB policy, Kafka quotas/topics, keys, dashboards, smoke tests и isolation negative tests; Terraform для провижининга, Kubernetes operator для reconciliation. |
+| [c2-multitenancy.puml](c2-multitenancy.puml) | Диаграмма контейнеров (C4): IAM (Keycloak), support elevation/break-glass, мониторинг по tenant tier без PII labels, квоты/rate limiting, fail-closed RLS, shared/dedicated Kafka tenant model. Проверена локальной компиляцией PlantUML без ошибок. |
+| [c3-onboarding.puml](c3-onboarding.puml) | Диаграмма компонентов (C4): внутреннее устройство Onboarding Service (Self-Service API, оркестратор, Terraform Runner, Tenant Operator, Smoke Test Runner) и потоки к Keycloak/БД/Kafka/Gateway/Grafana/Secrets Manager/KMS/внешним провайдерам. Проверена локальной компиляцией PlantUML без ошибок. |
 
 ## Как читать
 
@@ -34,6 +34,9 @@ Kafka-модель Task2, региональную модель и IAM/security-
   события ([Task2/01-domain-events.md](../Task2/01-domain-events.md)),
   наравне с уже существующими полями схемы — уточнение каталога событий,
   а не его замена.
+- Для pool-tenants Kafka использует shared topics и record key
+  `tenant_id:business_key`; фиксированные partition sets не используются
+  как основной механизм изоляции и не трактуются как partition-level ACL.
 - Онбординг переиспользует паттерн оркестрации из
   [Task2/04-saga.md](../Task2/04-saga.md) (Onboarding Service как
   оркестратор процесса) и практику обязательных проверок перед

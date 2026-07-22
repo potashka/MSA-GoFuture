@@ -10,17 +10,17 @@ Person(partner, "Партнёр / бизнес-девелопмент", "Под�
 Container_Boundary(onboarding, "Onboarding Service") {
     Component(selfServiceApi, "Self-Service API", "REST API", "Приём заявки, создание объекта Tenant (CRD), статус онбординга")
     Component(orchestrator, "Onboarding Orchestrator", "Оркестратор шагов", "Хранит прогресс заявки, инициирует следующий шаг, обрабатывает отказ (см. 03-onboarding.md)")
-    Component(terraformRunner, "Terraform Runner", "IaC executor", "Одноразовое провижининг: realm, топики, квоты, дашборды")
+    Component(terraformRunner, "Terraform Runner", "IaC executor", "Одноразовое провижининг: realm, DB policies, Kafka ACL/quotas/topics, keys, дашборды")
     Component(tenantOperator, "Tenant Operator", "Kubernetes controller", "Постоянное согласование состояния тенанта (reconciliation), апгрейд уровня изоляции, оффбординг")
     Component(smokeTestRunner, "Smoke Test Runner", "Test pipeline", "Сквозные проверки перед активацией")
 }
 
 Container(keycloak, "Keycloak", "IAM", "Realm/клиенты/федерация IdP тенанта")
-ContainerDb(serviceDbs, "Сервисные БД", "PostgreSQL", "tenant_id / RLS-политики (pool) либо выделенная схема (silo)")
-Container(kafka, "Kafka (per region)", "Apache Kafka", "Партиции/топики тенанта")
+ContainerDb(serviceDbs, "Сервисные БД", "PostgreSQL", "Pool: RLS fail-closed; dedicated/silo: выделенная схема/БД")
+Container(kafka, "Kafka (per region)", "Apache Kafka", "Pool: shared topics + quotas; dedicated: topics/keys; strict silo: cluster")
 Container(gateway, "API Gateway", "Gateway", "Квоты и rate limiting тенанта")
 Container(grafana, "Grafana", "Dashboards", "Дашборды тенанта")
-Container(secretsManager, "Secrets Manager", "Managed secret store", "Ключи локальных платёжных/картографических провайдеров")
+Container(secretsManager, "Secrets Manager / KMS", "Managed secret store", "Ключи провайдеров и tenant encryption keys")
 System_Ext(paymentProvider, "Локальный платёжный провайдер", "Внешняя интеграция")
 System_Ext(mapsProvider, "Локальный картографический провайдер", "Внешняя интеграция")
 
@@ -32,23 +32,23 @@ Rel(orchestrator, tenantOperator, "Передаёт объект Tenant на с�
 Rel(orchestrator, smokeTestRunner, "Запускает проверки после провижининга")
 
 Rel(terraformRunner, keycloak, "Создаёт realm, клиентов, федерацию IdP")
-Rel(terraformRunner, serviceDbs, "Создаёт схему/регистрирует tenant_id, проверяет RLS")
-Rel(terraformRunner, kafka, "Создаёт/резервирует топики и партиции")
+Rel(terraformRunner, serviceDbs, "Создаёт схему/регистрирует tenant_id; проверяет ENABLE/FORCE RLS, USING, WITH CHECK")
+Rel(terraformRunner, kafka, "Настраивает shared topic ACL/quotas или dedicated topics/keys")
 Rel(terraformRunner, gateway, "Настраивает квоты и rate limiting")
-Rel(terraformRunner, grafana, "Провижининг дашбордов (шаблон с переменной tenant_id)")
+Rel(terraformRunner, grafana, "Провижининг дашбордов (tenant_tier + limited tenant drill-down)")
 
 Rel(tenantOperator, keycloak, "Reconciliation realm/клиентов")
-Rel(tenantOperator, serviceDbs, "Reconciliation схемы/RLS при апгрейде уровня изоляции")
-Rel(tenantOperator, kafka, "Reconciliation топиков/партиций")
+Rel(tenantOperator, serviceDbs, "Reconciliation DB policy/runtime roles при апгрейде уровня изоляции")
+Rel(tenantOperator, kafka, "Reconciliation Kafka ACL/quotas/topics")
 Rel(tenantOperator, gateway, "Reconciliation квот")
 
-Rel(orchestrator, secretsManager, "Запрашивает ключи локальных провайдеров")
+Rel(orchestrator, secretsManager, "Запрашивает ключи локальных провайдеров и tenant keys")
 Rel(secretsManager, paymentProvider, "Ключи для конфигурации Payments Service тенанта")
 Rel(secretsManager, mapsProvider, "Ключи для конфигурации Geography Service тенанта")
 
 Rel(smokeTestRunner, keycloak, "Проверка входа/SSO")
-Rel(smokeTestRunner, serviceDbs, "Проверка изоляции: попытка кросс-тенантного чтения должна быть отклонена")
-Rel(smokeTestRunner, kafka, "Проверка tenant_id в событиях и партиционирования")
+Rel(smokeTestRunner, serviceDbs, "Negative tests: own read allowed, cross-tenant read/write denied, no tenant_id denied")
+Rel(smokeTestRunner, kafka, "Проверка tenant_id envelope, key tenant_id:business_key, quotas, consumer tenant check")
 Rel(smokeTestRunner, gateway, "Проверка квот/rate limiting")
 Rel(smokeTestRunner, grafana, "Проверка отображения данных на дашборде")
 

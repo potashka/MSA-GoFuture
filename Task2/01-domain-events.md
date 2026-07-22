@@ -27,15 +27,25 @@ Task1 определил доменные границы сервисов и и�
 `PayoutCompleted`, `FraudCheckCompleted`, `RideStarted`, `RideCompleted`,
 `NotificationRequested`.
 
+Операционные команды и результатные события асинхронной Saga
+(`DriverReservationRequested`, `DriverReserved`, `PriceLockRequested`,
+`PriceLocked`, `PaymentAuthorizationRequested`,
+`PaymentAuthorizationFailed` и др.) описаны отдельно в
+[04-saga.md](04-saga.md). Этот каталог фиксирует публичные доменные факты и
+команду Notification, которые могут потребляться за пределами Saga.
+
 ## Требования
 
-- У каждого события — ровно один логический продюсер (сервис-владелец
-  схемы), чтобы не возникало конкурирующих источников истины.
+- У каждого fact-события — ровно один логический продюсер (сервис-владелец
+  факта), чтобы не возникало конкурирующих источников истины. Для command-
+  событий владелец схемы фиксируется отдельно от допустимых producers:
+  команду могут публиковать несколько доменов, но только по единому
+  контракту владельца схемы.
 - Ключ партиционирования каждого события должен обеспечивать необходимый
   порядок обработки: `booking_id` — для событий саги поездки (шаги должны
-  обрабатываться по порядку в рамках одной поездки), `geo_cell`/`driver_id`
-  — там, где порядок важен в рамках зоны или конкретного водителя, а не
-  конкретной поездки.
+  обрабатываться по порядку в рамках одной поездки), `driver_id` или
+  `region_id:driver_id` — для локации водителя, `geo_cell` — для событий
+  состояния зоны.
 - Retention каждого события определяется его ролью: операционные события
   саги — короткий срок (данные фиксируются в БД сервиса-владельца, Kafka —
   лишь канал доставки), денежные и регуляторно значимые события — более
@@ -100,8 +110,10 @@ semantics (fact/command), retention.
 
 - **Продюсер**: Driver Service (результат "умного" подбора водителя, а не
   просто ближайшего, см. [Task1/02-service-map.md](../Task1/02-service-map.md)).
-- **Потребители**: Booking Service (оркестратор — прогресс саги);
-  Geography Service (обновление доступности в зоне); Analytics Service.
+- **Потребители**: Geography Service (обновление доступности в зоне);
+  Analytics Service. Booking Service может использовать событие для
+  read-model/audit, но переход Saga выполняется по результатному событию
+  `DriverReserved` из [04-saga.md](04-saga.md), а не по `DriverAssigned`.
 - **Ключевые поля схемы**: `booking_id`, `driver_id`, `assigned_at`,
   `driver_geo_cell`, `eta_to_pickup`, `match_reason` (например,
   `smart-reposition`/`nearest-fallback`).
@@ -118,22 +130,58 @@ semantics (fact/command), retention.
   зонам); Pricing/Flink (сигнал предложения для surge, см.
   [03-stream-processing.md](03-stream-processing.md)); Booking Service
   (обновление ETA для активных поездок); Analytics Service (сэмплированно).
-- **Ключевые поля схемы**: `driver_id`, `geo_cell`, `lat`, `lon`, `speed`,
-  `heading`, `status` (`available`/`busy`/`offline`), `updated_at`.
-- **Ключ партиционирования**: `geo_cell` (не `booking_id` — событие не
-  привязано к конкретной поездке; партиционирование по зоне даёт локальность
-  для оконных агрегаций в Flink, см. [02-kafka-topics.md](02-kafka-topics.md)).
+- **Ключевые поля схемы**: envelope: `event_id`, `event_type`,
+  `event_version`, `occurred_at`, `region_id`, `tenant_id` (если включена
+  мультитенантность), `sequence_number`; payload: `driver_id`, `geo_cell`,
+  `latitude`/`longitude` либо безопасное представление координат
+  (например, H3/S2 cell + сниженная точность), `speed`, `heading`, `status`
+  (`available`/`busy`/`offline`).
+- **Пример envelope/payload**:
+
+  ```json
+  {
+    "event_id": "01JZ4V1QY3N9S7K5E0Z8H2M4CN",
+    "event_type": "DriverLocationUpdated",
+    "event_version": 2,
+    "occurred_at": "2026-07-17T10:15:30.123Z",
+    "region_id": "sea",
+    "tenant_id": "gofuture",
+    "payload": {
+      "driver_id": "drv_42",
+      "geo_cell": "h3_8_886520d9bfffff",
+      "latitude": 1.3521,
+      "longitude": 103.8198,
+      "speed": 32.4,
+      "heading": 87,
+      "status": "available",
+      "sequence_number": 184233
+    }
+  }
+  ```
+
+- **Ключ партиционирования / Kafka record key**: `region_id:driver_id` в
+  общем регионально-неймспейсированном топике либо `driver_id` внутри
+  отдельного регионального топика, например `sea.driver.location.updated`.
+  `geo_cell` хранится в payload и не используется как Kafka record key для
+  этого события.
 - **Semantics**: fact (по характеру — телеметрия состояния, естественно
-  сжимаемая по ключу `driver_id` при log compaction).
-- **Retention**: короткий (единицы часов) + log compaction по `driver_id`
-  для хранения только последнего известного состояния (см.
+  сжимаемая по record key водителя при log compaction).
+- **Порядок и группировка**: Kafka сохраняет порядок обновлений одного
+  водителя, потому что все события с одним `region_id:driver_id` попадают в
+  одну партицию. Flink после чтения выполняет перегруппировку
+  `keyBy(event.payload.geo_cell)` для оконных агрегаций по ячейкам.
+- **Retention**: короткий (единицы часов) + log compaction по record key
+  `region_id:driver_id`/`driver_id` для хранения только последнего
+  известного состояния водителя (см.
   [02-kafka-topics.md](02-kafka-topics.md)).
 
 ### PriceCalculated
 
 - **Продюсер**: Pricing Service.
-- **Потребители**: Booking Service (оркестратор — сумма для авторизации
-  платежа); Analytics Service.
+- **Потребители**: Analytics Service. Booking Service может использовать
+  событие для read-model/audit, но переход Saga и сумма авторизации
+  берутся из результатного события `PriceLocked` из
+  [04-saga.md](04-saga.md), а не из публичного `PriceCalculated`.
 - **Ключевые поля схемы**: `booking_id`, `base_fare`, `surge_multiplier`,
   `final_price`, `currency`, `pricing_geo_cell`, `calculated_at`.
 - **Ключ партиционирования**: `booking_id`.
@@ -185,9 +233,11 @@ semantics (fact/command), retention.
 ### PaymentFailed
 
 - **Продюсер**: Payments Service.
-- **Потребители**: Booking Service (оркестратор — триггер компенсации
-  саги, см. [04-saga.md](04-saga.md)); Fraud Service (сигнал риска —
+- **Потребители**: Fraud Service (сигнал риска —
   повторные отказы платежа); Analytics Service.
+  Booking Service может использовать событие для audit, но компенсация
+  Saga запускается по результатному событию `PaymentAuthorizationFailed`
+  из [04-saga.md](04-saga.md), а не по публичному `PaymentFailed`.
 - **Ключевые поля схемы**: `booking_id`, `payment_id`, `failure_reason`,
   `failure_code`, `failed_at`.
 - **Ключ партиционирования**: `booking_id`.
@@ -259,10 +309,12 @@ semantics (fact/command), retention.
 
 ### NotificationRequested
 
-- **Продюсер**: любой доменный сервис, которому требуется уведомить
+- **Владелец схемы**: Notification Service.
+- **Допустимые producers**: доменные сервисы, которым требуется уведомить
   пользователя (Booking, Payments, Payouts, Pricing/Surge — для
-  водителей, Driver) — единая явная команда вместо подписки Notification
-  Service на весь поток доменных событий.
+  водителей, Driver), публикуют команду по схеме Notification Service. Это
+  осознанное исключение для command-события: владелец контракта один, но
+  отправителей команды несколько.
 - **Потребители**: Notification Service (единственный потребитель).
 - **Ключевые поля схемы**: `notification_id`, `recipient_type`
   (`passenger`/`driver`), `recipient_id`, `template_code`, `payload`
@@ -289,18 +341,23 @@ semantics (fact/command), retention.
   [Task1/02-service-map.md](../Task1/02-service-map.md)).
 - **Единый ключ партиционирования (`booking_id`) для всех событий, включая
   `DriverLocationUpdated`.** Отклонено: локация не привязана к конкретной
-  поездке (водитель не в поездке тоже шлёт локацию) и требует
-  партиционирования по `geo_cell` для эффективных оконных агрегаций в
-  Flink и равномерного распределения нагрузки (см.
-  [02-kafka-topics.md](02-kafka-topics.md)).
+  поездке (водитель не в поездке тоже шлёт локацию).
+- **Ключ партиционирования `geo_cell` для `DriverLocationUpdated`.**
+  Отклонено: Kafka log compaction работает по record key. Если ключом
+  сделать `geo_cell`, compacted topic сохранит последнее событие на
+  геоячейку, а не последнее состояние каждого водителя. Кроме того,
+  водитель при движении меняет `geo_cell`, и порядок его обновлений может
+  попасть в разные партиции. Локальность для оконных агрегаций достигается
+  во Flink через `keyBy(event.payload.geo_cell)`, а не через Kafka record
+  key.
 - **Публиковать команды шагов саги (`FraudCheckRequested`,
-  `PriceCalculationRequested` и т. п.) как самостоятельные каталогизируемые
-  доменные события.** Отклонено на уровне этого каталога: команды,
-  которыми оркестратор инициирует каждый шаг, — это адресные вызовы
-  "точка-точка" (синхронный вызов или выделенный командный канал, см.
+  `PriceLockRequested`, `DriverReservationRequested` и т. п.) как
+  самостоятельные публичные доменные события.** Отклонено на уровне этого
+  каталога: команды, которыми оркестратор инициирует каждый шаг, — это
+  адресные сообщения в Kafka для конкретного участника Saga (см.
   [04-saga.md](04-saga.md)), а не широковещательные факты; в каталог
-  включены только результирующие факты каждого шага, которые действительно
-  представляют интерес для нескольких потребителей.
+  включены только публичные факты, которые представляют интерес для
+  нескольких потребителей.
 
 ## Компромиссы и риски
 
@@ -316,14 +373,14 @@ semantics (fact/command), retention.
 - Денежные события (`Payment*`, `Payout*`) имеют более долгий retention
   (30–90 дней) — увеличивает объём хранения Kafka, требует явной политики
   размера диска/tiered storage на кластере.
-- Порядок событий жизненного цикла поездки (`BookingCreated` →
+- Порядок публичных событий жизненного цикла поездки (`BookingCreated` →
   `FraudCheckCompleted` → `PriceCalculated` → `DriverAssigned` →
   `PaymentAuthorized` → `BookingConfirmed` → `RideStarted` →
   `RideCompleted` → `PaymentCaptured` → `PayoutInitiated` →
-  `PayoutCompleted`) не должен нарушаться; корректность порядка
-  обеспечивается конструкцией саги (оркестратор — единственный, кто решает,
-  когда переходить к следующему шагу), а не самой Kafka (см.
-  [04-saga.md](04-saga.md)).
+  `PayoutCompleted`) не должен противоречить внутреннему порядку Saga;
+  корректность переходов Saga обеспечивается её результатными событиями
+  (`PriceLocked`, `DriverReserved`, `PaymentAuthorized` и отказные пары),
+  а не самой Kafka (см. [04-saga.md](04-saga.md)).
 
 ## Статус
 

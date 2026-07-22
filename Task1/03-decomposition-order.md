@@ -25,7 +25,8 @@ Notification сегодня дают каскадные отказы при на
 - Каждый этап должен заканчиваться сервисом в проде, обслуживающим реальный
   трафик, а не только "выделенным в теории" кодом.
 - Риск каждого следующего этапа не должен обгонять зрелость отработанных на
-  предыдущих этапах паттернов (CDC, dual-write, reconciliation, Saga,
+  предыдущих этапах паттернов (authoritative writer, однонаправленный CDC,
+  shadow reads, reconciliation, Saga,
   contract-тесты — см. [04-backward-compatibility.md](04-backward-compatibility.md),
   [05-data-migration-plan.md](05-data-migration-plan.md)).
 - Денежные потоки (Payments, Payouts) не выносятся до того, как паттерны
@@ -111,8 +112,9 @@ Notification сегодня дают каскадные отказы при на
 - **Почему пятым, только после отработки паттернов**: высокий риск ошибки
   (деньги, регуляторные требования, требование С2 — Saga вместо
   распределённых транзакций). Выносятся только после того, как на четырёх
-  предыдущих доменах отработаны CDC, dual-write, reconciliation, откат по
-  feature flag и contract-тесты (см.
+  предыдущих доменах отработаны один authoritative writer на сущность,
+  однонаправленный CDC, shadow reads, reconciliation, откат по feature flag
+  и contract-тесты (см.
   [05-data-migration-plan.md](05-data-migration-plan.md),
   [04-backward-compatibility.md](04-backward-compatibility.md)). Payments и
   Payouts выносятся как два отдельных сервиса (см.
@@ -160,6 +162,76 @@ Notification сегодня дают каскадные отказы при на
   Gateway); все 9 доменных сервисов и оба платформенных сервиса работают
   независимо друг от друга по метрикам Э1–Э4 ([01-nfr.md](01-nfr.md)).
 
+### Годовой план декомпозиции
+
+Очерёдность выше задаёт зависимость рисков, а годовой план задаёт календарь
+исполнения. Работы ведутся не одной последовательной командой: восемь
+продуктовых команд (Booking, Driver, Pricing, Payments & Payouts,
+Notification, Geography, Fraud, Analytics) работают параллельно с
+платформенной и SRE-командами. При этом переход к следующему рисковому этапу
+разрешён только после go/no-go проверки: выполнены SLO соответствующего
+класса сервиса из [01-nfr.md](01-nfr.md), завершена автоматическая сверка
+данных, проверен rollback, зелёные contract tests и проведён game day. Для
+Tier-1 сервисов (Booking, Driver, Pricing, Payments, API Gateway, Identity)
+плановый простой при переключении трафика не допускается: используются
+shadow/canary, feature flags, ACL и мгновенный возврат маршрута на монолитный
+путь.
+
+| Период | Домены | Платформенные работы | Зависимости | Доля трафика | Exit criteria | Откат |
+|---|---|---|---|---|---|---|
+| Месяц 1 | Подготовка Notification и Geography | Platform baseline, CI/CD-шаблон сервиса, базовая observability, Kafka dev/stage, API Gateway route flags, начало подготовки Database-per-Service | Старт программы, утверждённые НФТ и карта сервисов | Shadow для Notification событий; prod traffic остаётся в монолите | Baseline принят SRE; сборка сервиса укладывается в Э2; определены SLO/алерты; contract tests подключены в CI | Откат не затрагивает пользователей: shadow-consumers отключаются, маршруты остаются в монолите |
+| Месяц 2 | Notification | Kafka/CDC для уведомлений, service mesh/mTLS для пилота, ACL и feature flag отката | Готовы platform baseline, Kafka dev/stage, CI/CD и route flags из месяца 1 | Shadow → canary 5–25% → 100% уведомлений | Notification обслуживает 100%; сверка шаблонов/настроек успешна; rollback по флагу проверен на game day | `use_notification_service=false`, возврат отправки уведомлений на монолит без redeploy |
+| Месяц 3 | Geography | Elasticsearch snapshot + CDC, Kafka topics `HotZoneDetected`/`ZoneDemandUpdated`, dashboards нагрузки | Notification завершён; Kafka/CDC/contract tests проверены на пилоте | Shadow геопоиска → canary 10–50% | Геопоиск и hot zones выдерживают нагрузку без деградации; Driver/Pricing contract tests зелёные | Geo routes возвращаются на монолит/read-replica, ES индекс продолжает синхронизацию |
+| Месяц 4 | Geography, подготовка Pricing | API Gateway rules для geo routes, расширение observability, подготовка Pricing DB и контрактов | Canary Geography стабилен, контракты событий для Driver/Pricing зелёные | Geography canary 50% → 100%; Pricing shadow quotes | Geography на 100%; rollback geo routes проверен; Pricing reconciliation на исторических котировках готов к canary | Geo flag возвращает 100% на монолит; Pricing остаётся в shadow без пользовательского эффекта |
+| Месяц 5 | Pricing | Circuit breaker/fallback для Booking → Pricing, CI/CD для Pricing, Kafka signals от Geography | Geography на 100%, Pricing shadow/reconciliation готовы | Shadow → canary 5–25% котировок | Pricing соблюдает П4; сверка котировок успешна; откат на монолитный расчёт проверен | Gateway/ACL возвращает `CalculatePrice` на монолит, fallback остаётся включённым |
+| Месяц 6 | Pricing, подготовка Driver | Service mesh policies для синхронных вызовов, подготовка Driver ingestion, нагрузочные тесты геопотока | Pricing canary без деградации П4, события Geography стабильны | Pricing canary 25–100%; Driver shadow location stream | Pricing на 100%; Driver выдерживает shadow-поток без влияния на П3; contract tests Booking/Driver готовы | Pricing route возвращается на монолит; Driver shadow stream отключается без потери системы записи |
+| Месяц 7 | Driver | Re-keying геолокации, Kafka ingestion, матчер, fallback до базового подбора | Pricing на 100%, Driver shadow выдержал нагрузку, Booking/Driver контракты зелёные | Shadow → canary 5–30% матчинга и location writes | Driver соблюдает П3 на canary; сверка активных статусов водителей в допустимом пороге; rollback проверен | Возврат location/matching routes на монолит, сервис продолжает получать CDC для восстановления актуального состояния |
+| Месяц 8 | Driver, подготовка Payments и Payouts | Укрепление Database-per-Service, денежные идемпотентные ключи, Saga-контракты, аудит data residency | Driver canary стабилен; authoritative writer/CDC/reconciliation отработаны на четырёх доменах | Driver canary 30–100%; Payments/Payouts shadow ledger | Driver на 100%; Saga dry-run зелёный; денежная сверка shadow без расхождений до допуска canary | Driver возвращается на монолитный путь; Payments/Payouts остаются shadow-only |
+| Месяц 9 | Payments и Payouts | Saga compensation, регуляторные проверки, усиленные алерты RPO/RTO, ручные runbook для инцидентов | Driver на 100%, Saga dry-run и нулевая денежная сверка shadow | Shadow → canary 1–10% платежей/выплат | Нулевое расхождение денежных таблиц; Payments соблюдает Tier-1 Д1/Д3; rollback до записи проверен | До переключения записи — флаг на монолит; после записи — только инцидентный обратный экспорт |
+| Месяц 10 | Payments и Payouts, Fraud и Analytics | Kafka event completeness, ClickHouse/Flink витрины, Fraud scoring stream | Payments/Payouts canary без расхождений, компенсации Saga проверены | Payments/Payouts canary 10–100%; Fraud/Analytics shadow | Payments/Payouts на 100%; компенсации Saga проверены; Fraud/Analytics имеют полный поток событий | Денежные маршруты возвращаются по runbook допустимого этапа; Fraud/Analytics возвращаются к AS-IS SQL/синхронным проверкам |
+| Месяц 11 | Fraud и Analytics, подготовка Booking | Замена прямого SQL на события, витрины Analytics, Booking ACL/Saga orchestration readiness | Payments/Payouts на 100%, все операционные события публикуются в Kafka | Fraud/Analytics shadow → canary 25–100%; Booking shadow orchestration | Fraud coverage не ниже AS-IS; витрины без критичных пробелов; Booking contract tests со всеми сервисами зелёные | Fraud flag возвращает синхронную проверку в монолит; Analytics использует прежние SQL-отчёты |
+| Месяц 12 | Booking | Финальный strangler route, отключение активных путей монолита, финальный game day, cleanup старых таблиц после контрольного периода | Все зависимости Booking вынесены, SLO/сверка/rollback/contract tests/game day выполнены | Shadow → canary 1–25% → 100% Booking routes без простоя | Booking соблюдает П2/Д1/Д3; все домены на 100%; rollback маршрута проверен; монолит не принимает активный трафик | До завершения программы route flag возвращает Booking на монолит; удаление старых таблиц только после отдельного go/no-go |
+
+Детализация по кварталам:
+
+- **Q1, месяцы 1–3: платформа и низкорисковые домены.** Notification team
+  выносит Notification как пилот, Geography team начинает параллельную
+  подготовку геоданных, платформенная команда поднимает platform baseline,
+  CI/CD, Kafka, API Gateway flags, service mesh/mTLS и шаблон
+  Database-per-Service. SRE определяет SLO, dashboards, error budgets и
+  проводит первый rollback game day. Зависимость: до canary Geography должны
+  быть подтверждены Kafka/CDC/contract-test паттерны на Notification.
+  Откат: выключение `use_notification_service` или geo-route flag без
+  redeploy; запись остаётся совместимой с монолитом до завершения сверки.
+- **Q2, месяцы 4–6: Pricing и подготовка горячего Driver-потока.** Pricing
+  team переводит расчёт котировок через shadow/canary к 100%, Geography
+  завершает 100% трафика, Driver team параллельно готовит ingestion
+  геолокации и контракты с Booking. Платформенная команда дорабатывает
+  service mesh policies, latency dashboards и контрактное тестирование
+  синхронных API. Зависимость: Driver canary не стартует, пока Pricing не
+  выполняет П4 и не проверен fallback Booking → Pricing. Откат: возврат
+  котировок и матчинга на монолитные пути через Gateway/ACL flags.
+- **Q3, месяцы 7–9: Driver и денежные домены.** Driver team доводит
+  location stream и matching до 100%, а Payments & Payouts team параллельно
+  готовит ledger, идемпотентность, Saga и регуляторные проверки. Payments
+  допускаются только после успешных CDC/shadow reads/reconciliation на
+  предыдущих доменах и game day с откатом. Зависимость: canary денежных
+  операций начинается после 100% Driver и нулевой денежной сверки в shadow.
+  Откат: до переключения записи — мгновенный флаг на монолит; после
+  переключения записи — только инцидентная процедура восстановления через
+  обратный экспорт, как описано в [05-data-migration-plan.md](05-data-migration-plan.md).
+- **Q4, месяцы 10–12: событийные потребители и Booking.** Fraud team и
+  Analytics/data-инженеры заменяют прямой SQL/синхронные проверки на
+  событийную модель, пока Booking team готовит финальную оркестрацию и
+  маршруты через API Gateway. Платформенная и SRE-команды фокусируются на
+  event completeness, SLO для Tier-1, финальном game day и контролируемом
+  выводе монолитных путей. Зависимость: Booking canary разрешён только после
+  100% Payments/Payouts, полного набора событий для Fraud/Analytics и
+  зелёных contract tests со всеми зависимостями. Откат: до завершения
+  программы маршрут Booking возвращается на монолитный путь без планового
+  простоя; удаление старых таблиц выполняется только после контрольного
+  периода и отдельного go/no-go.
+
 ## Альтернативы
 
 - **Начать с Booking, так как это ядро бизнес-ценности.** Отклонено:
@@ -169,7 +241,7 @@ Notification сегодня дают каскадные отказы при на
   простоя критического сервиса.
 - **Начать с Payments, так как это напрямую про деньги и regulatory
   compliance.** Отклонено: наивысшая цена ошибки при отсутствии
-  отработанных паттернов dual-write/reconciliation/Saga; риск неприемлем на
+  отработанных паттернов authoritative writer/reconciliation/Saga; риск неприемлем на
   первом этапе, когда инструментарий миграции ещё не проверен на практике.
 - **Big bang — переписать монолит целиком и переключиться одномоментно.**
   Отклонено явным требованием задачи (миграция без big bang) и требованием

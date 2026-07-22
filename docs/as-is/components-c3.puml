@@ -1,4 +1,4 @@
-@startuml Component_Diagram_Final
+@startuml components-c3
 !include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
 
 ' ### СИСТЕМНЫЕ ГРАНИЦЫ ###
