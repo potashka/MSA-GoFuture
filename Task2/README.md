@@ -45,6 +45,5 @@
 
 ## Скриншоты диаграмм
 
-PNG-рендер [c2-event-platform.puml](c2-event-platform.puml) должен лежать в
-[../renders/Task2/](../renders/Task2/) и обновляться после изменения
-PlantUML-исходника.
+PNG-рендер [c2-event-platform.puml](c2-event-platform.puml) находится в
+[../renders/Task2/](../renders/Task2/).
