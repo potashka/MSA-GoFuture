@@ -1,0 +1,58 @@
+@startuml geo-routing-schema
+title Геомаршрутизация — edge рядом с клиентом, поездка в ride_region
+
+skinparam sequenceParticipantBackgroundColor White
+skinparam sequenceParticipantBorderColor Black
+skinparam sequenceParticipantFontColor Black
+skinparam sequenceArrowColor Black
+
+actor "Пассажир\nprofile_region=sao" as user
+participant "GeoDNS /\nlatency-based routing" as dns
+participant "Anycast IP\nAPI Gateway" as anycast
+participant "API Gateway\ncurrent_edge_region=sgp" as gwSgp #FFCCCC
+participant "Ride Region Resolver\npickup/city/tenant/market" as resolver #FFCCCC
+participant "Profile/Identity\nprofile_region=sao" as identitySao #FFCCCC
+participant "API Gateway\nride_region=jkt" as gwJkt #FFCCCC
+participant "Booking Service\nride_region=jkt" as booking #FFCCCC
+participant "Geography/Pricing/Driver\nride_region=jkt" as ops #FFCCCC
+participant "Local Payments Adapter\nIndonesia" as pay #FFCCCC
+
+user -> dns : Резолв доменного имени API
+dns -> user : Ближайший по сети edge (sgp)
+user -> anycast : CreateBooking + token(profile_region=sao, tenant_id)
+anycast -> gwSgp : BGP направляет на ближайший здоровый edge
+
+gwSgp -> identitySao : Проверка JWT/JWKS/claims\nбез чтения profile DB в hot path
+identitySao --> gwSgp : token valid, profile_region=sao
+
+gwSgp -> resolver : Определить ride_region\npickup=Jakarta, selected_city=Jakarta,\ntenant/market=Indonesia
+resolver --> gwSgp : ride_region=jkt
+
+note right of resolver #FFCCCC
+  profile_region хранит профиль и IAM/account data.
+  ride_region выбирается для конкретной поездки.
+  Старый home_region = alias profile_region,
+  но не регион операционной поездки.
+end note
+
+alt current_edge_region != ride_region
+    gwSgp -> user : endpoint ride_region=jkt\nили прозрачный proxy только для CreateBooking
+    user -> gwJkt : Активная сессия поездки\nнапрямую в jkt
+else current_edge_region == ride_region
+    gwSgp -> gwJkt : Локальная обработка без redirect
+end
+
+gwJkt -> booking : CreateBooking в ride_region=jkt
+booking -> ops : Локальная карта, локальная цена,\nлокальные водители, Fraud realtime
+booking -> pay : Авторизация через допустимый\nлокальный платёжный адаптер
+booking --> gwJkt : booking_id + ride_region=jkt
+gwJkt --> user : Поездка закреплена за jkt до завершения
+
+note over booking,ops #FFCCCC
+  Location updates, Booking Saga, Driver, Pricing,
+  Geography и Payments Adapter работают в ride_region.
+  Нет прямого межрегионального обращения
+  к пользовательской БД на каждый update.
+end note
+
+@enduml

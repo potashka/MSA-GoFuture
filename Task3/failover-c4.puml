@@ -1,0 +1,114 @@
+@startuml failover-c4
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Deployment.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Диаграмма аварийного переключения (C4) — Tier-1 ride APIs на примере региона Джакарта (jkt)
+
+UpdateElementStyle("new", $bgColor="red", $fontColor="white")
+UpdateRelStyle("new", $textColor="red", $lineColor="red")
+
+Person(sre, "SRE / Incident Commander", "Ручное подтверждение DR, fencing и failback", $tags="new")
+System_Ext(paymentProviderA, "Платёжный провайдер A", "Региональный провайдер")
+System_Ext(paymentProviderB, "Платёжный провайдер B", "Резервный допустимый провайдер", $tags="new")
+System_Ext(mapsProviderA, "Картографический провайдер A", "Региональный провайдер")
+System_Ext(mapsProviderB, "Картографический провайдер B", "Резервный допустимый провайдер", $tags="new")
+
+Deployment_Node(gslb, "GSLB / GeoDNS / Anycast", "Глобальный сетевой слой", "Health checks, TTL 30-60s, connection draining, защита от flapping", $tags="new")
+
+Deployment_Node(jkt, "Production region: jkt", "Indonesia legal zone"){
+
+    Container(k8sPolicy, "Kubernetes HA baseline", "PDB / topology spread / HPA", "Stateless Tier-1 workloads в нескольких AZ; >=2 доступных pod во время плановых работ", $tags="new")
+    Container(fencing, "Primary Fencing / Leader Lock", "HA control", "Блокирует старый PostgreSQL primary перед promotion; защита от split-brain", $tags="new")
+    Container(redis, "Redis cache", "Cache", "Не источник истины; потеря кэша допустима, состояние восстанавливается из БД/событий", $tags="new")
+
+    Deployment_Node(az1, "Availability Zone 1"){
+        Container(gw1, "API Gateway", "Ingress instance", "Tier-1 API endpoint")
+        Container(rideSvc1, "Booking/Driver/Pricing/Payments", "Kubernetes pods", "Stateless Tier-1 workloads", $tags="new")
+        Container(kafka1, "Kafka broker", "Apache Kafka", "Broker/partition leader")
+        ContainerDb(pg1, "PostgreSQL", "Primary", "Writer для ride_region")
+    }
+    Deployment_Node(az2, "Availability Zone 2"){
+        Container(gw2, "API Gateway", "Ingress instance")
+        Container(rideSvc2, "Booking/Driver/Pricing/Payments", "Kubernetes pods", "Stateless Tier-1 workloads", $tags="new")
+        Container(kafka2, "Kafka broker", "Apache Kafka", "ISR replica")
+        ContainerDb(pg2, "PostgreSQL", "Sync/Semisync standby", "RPO 0 при sync; <=1 мин при semisync")
+    }
+    Deployment_Node(az3, "Availability Zone 3"){
+        Container(gw3, "API Gateway", "Ingress instance")
+        Container(rideSvc3, "Booking/Driver/Pricing/Payments", "Kubernetes pods", "Stateless Tier-1 workloads", $tags="new")
+        Container(kafka3, "Kafka broker", "Apache Kafka", "ISR replica")
+        ContainerDb(pg3, "PostgreSQL", "Sync/Semisync standby", "RPO 0 при sync; <=1 мин при semisync")
+    }
+
+    Container(payments, "Local Payments Adapter", "Domain adapter", "Circuit breaker, idempotency keys, fallback provider", $tags="new")
+    Container(geography, "Local Geography Adapter", "Domain adapter", "Circuit breaker, fallback maps/routing provider", $tags="new")
+}
+
+Deployment_Node(jktDr, "DR site внутри той же юридической зоны", "Warm standby", $tags="new"){
+    Container(drGateway, "DR API Gateway", "Ingress", "Включается при подтверждённом regional DR", $tags="new")
+    ContainerDb(drPg, "DR PostgreSQL replica", "Async standby", "Только разрешённые данные; целевой lag <=5 мин", $tags="new")
+    Container(drKafka, "DR Kafka cluster", "Apache Kafka", "MirrorMaker 2 / аналог; целевой lag <=5 мин", $tags="new")
+}
+
+Rel(gslb, gw1, "Маршрутизация healthy endpoint", "HTTPS", $tags="new")
+Rel(gslb, gw2, "Маршрутизация healthy endpoint", "HTTPS", $tags="new")
+Rel(gslb, gw3, "Маршрутизация healthy endpoint", "HTTPS", $tags="new")
+Rel(gslb, drGateway, "DR cutover только после fencing и проверки residency", "manual approval", $tags="new")
+
+Rel(k8sPolicy, rideSvc1, "PDB, anti-affinity/topology spread, autoscaling", $tags="new")
+Rel(k8sPolicy, rideSvc2, "PDB, anti-affinity/topology spread, autoscaling", $tags="new")
+Rel(k8sPolicy, rideSvc3, "PDB, anti-affinity/topology spread, autoscaling", $tags="new")
+
+Rel(pg1, pg2, "Sync/Semisync replication", "RPO 0 или <=1 мин", $tags="new")
+Rel(pg1, pg3, "Sync/Semisync replication", "RPO 0 или <=1 мин", $tags="new")
+Rel(fencing, pg1, "Fencing старого primary перед promotion", $tags="new")
+
+Rel(kafka1, kafka2, "RF>=3, min.insync.replicas>=2", "acks=all", $tags="new")
+Rel(kafka1, kafka3, "RF>=3, min.insync.replicas>=2", "acks=all", $tags="new")
+Rel(kafka1, drKafka, "MirrorMaker 2 / async allowed streams", "RPO = replication lag", $tags="new")
+Rel(pg1, drPg, "Async DR replication для разрешённых данных", "RPO = replication lag", $tags="new")
+
+Rel(rideSvc1, redis, "Cache read/write; fallback to DB/events", $tags="new")
+Rel(rideSvc2, redis, "Cache read/write; fallback to DB/events", $tags="new")
+Rel(rideSvc3, redis, "Cache read/write; fallback to DB/events", $tags="new")
+
+Rel(payments, paymentProviderA, "Авторизация платежа", "HTTPS")
+Rel(payments, paymentProviderB, "Fallback при отказе провайдера", "HTTPS", $tags="new")
+Rel(geography, mapsProviderA, "Маршрутизация/ETA", "HTTPS")
+Rel(geography, mapsProviderB, "Fallback при отказе провайдера", "HTTPS", $tags="new")
+Rel(sre, fencing, "Подтверждает DR/failback, проверяет split-brain", $tags="new")
+Rel(sre, gslb, "Исключение/возврат региона, hold-down против flapping", $tags="new")
+
+note right of k8sPolicy #FFCCCC
+  Pod/node: RTO <=1-2 мин, RPO 0.
+  AZ: RTO <=5 мин.
+  Плановый простой Tier-1 не допускается.
+end note
+
+note right of pg1 #FFCCCC
+  PostgreSQL primary: RTO <=5-10 мин.
+  Promotion только после fencing старого primary.
+  Cross-region async имеет RPO по lag, а не RPO 0.
+end note
+
+note right of kafka1 #FFCCCC
+  Kafka broker: RTO <=1 мин.
+  RF>=3, min.insync.replicas>=2,
+  producer acks=all, unclean leader election disabled.
+end note
+
+note bottom of jktDr #FFCCCC
+  Полный отказ региона:
+  1) DR внутри той же юридической зоны: RTO <=15-30 мин, RPO = lag.
+  2) Если cross-border transfer не квалифицирован: degraded mode,
+     новые операции в недоступном ride_region ограничиваются
+     до восстановления или локальной standby-площадки.
+end note
+
+legend right
+  |Цвет|Значение|
+  |<back:red><color:white>Красный</color></back>|Новые или изменённые элементы Task3: 99,99% Tier-1 HA/DR, RTO/RPO, split-brain controls|
+endlegend
+
+@enduml

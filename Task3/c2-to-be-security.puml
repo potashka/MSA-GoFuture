@@ -1,0 +1,178 @@
+@startuml c2-to-be-security
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Диаграмма контейнеров (C2) — GoFuture с инструментами защиты (доработка Task1/c2-to-be.puml)
+
+UpdateElementStyle("new", $bgColor="red", $fontColor="white")
+UpdateRelStyle("new", $textColor="red", $lineColor="red")
+
+Person(passenger, "Пассажир", "Пользователь мобильного приложения")
+Person(driverUser, "Водитель", "Пользователь мобильного приложения водителя")
+Person(corpUser, "Корпоративный клиент", "Пользователь веб-портала")
+Person(admin, "Администратор", "Пользователь админ-панели")
+
+System_Ext(yandexPay, "Яндекс Пэй", "Платёжный провайдер")
+System_Ext(yandexMaps, "Яндекс Карты", "Картографический сервис")
+System_Ext(pushProviders, "FCM / APNs / Huawei Push Kit", "Push-уведомления")
+System_Ext(bankApi, "API банков", "Банковские платежи и выплаты")
+
+Container(gslb, "GSLB / GeoDNS / Anycast", "Global traffic management", "Health checks, TTL 30-60s, connection draining, исключение неисправного региона, anti-flapping", $tags="new")
+Container(ddosProtection, "DDoS-защита", "Anti-DDoS service", "Поглощение объёмных атак на сетевом уровне перед WAF", $tags="new")
+Container(waf, "WAF", "Web Application Firewall", "Фильтрация вредоносного трафика на уровне HTTP перед API Gateway", $tags="new")
+
+System_Boundary(gofuture, "GoFuture Platform") {
+
+    Container(securityGroups, "Network Security Groups / Firewall", "Cloud network ACL", "Сетевая сегментация: ограничивает, какие сегменты вообще могут обращаться друг к другу", $tags="new")
+    Container(regionalHa, "Regional HA Baseline", "Kubernetes / SRE policy", "Multi-AZ stateless workloads, PDB, topology spread, autoscaling, несколько ingress/gateway instances", $tags="new")
+    Container(drControl, "DR Control / Fencing", "Runbook + automation", "Fencing старого primary, split-brain protection, ручной regional cutover/failback", $tags="new")
+    Container(secretsManager, "Secrets Manager", "Managed secret store", "Хранение и ротация секретов: креды БД, сертификаты mTLS, ключи внешних платёжных интеграций", $tags="new")
+    Container(serviceMesh, "Service Mesh (control plane)", "mTLS enforcement", "Выпуск и ротация сертификатов, принудительное mTLS между всеми сервисами", $tags="new")
+
+    Container(mobileApps, "Мобильные приложения", "iOS / Android / Huawei", "Приложения пассажира и водителя")
+    Container(webPortal, "Веб-портал и админ-панель", "Web", "Корпоративный портал и админ-панель")
+
+    Container(gateway, "API Gateway", "Kubernetes Ingress / Gateway", "Маршрутизация, версионирование API, feature flags, current_edge_region и передача CreateBooking в ride_region", $tags="new")
+    Container(rideRegionResolver, "Ride Region Resolver", "Routing Policy", "Определяет ride_region по pickup/city/tenant/market/app config; не по profile_region", $tags="new")
+    Container(profileProjection, "Profile Attributes Projection", "Read-only cache", "Минимальные разрешённые атрибуты профиля без PII для hot path в ride_region", $tags="new")
+    Container(identity, "Identity Service", "Keycloak", "Аутентификация, авторизация, IAM; token claims tenant_id/profile_region, ride_region = контекст операции", $tags="new")
+
+    Container(acl, "Anti-Corruption Layer", "Adapter Service", "Транслирует контракты монолита в контракты доменных сервисов и обратно")
+
+    Container(monolith, "Монолит GoFuture (усыхающий)", "Django, Celery, RabbitMQ", "Домены, ещё не вынесенные из монолита; сокращается по мере миграции")
+    ContainerDb(monolithDb, "Monolith DB", "PostgreSQL RDS", "Исходная база монолита, источник CDC")
+    Container(cdc, "CDC Connector", "Debezium", "Захват изменений (WAL) из БД монолита и публикация в шину событий")
+
+    Container(kafka, "Event Bus", "Apache Kafka", "Асинхронная шина доменных событий")
+
+    Container(booking, "Booking Service", "Domain Service", "Приём и жизненный цикл заказа поездки в ride_region", $tags="new")
+    ContainerDb(bookingDb, "Booking DB", "PostgreSQL", "Заказы, статусы поездок")
+
+    Container(driverSvc, "Driver Service", "Domain Service", "Локация, доступность и матчинг локальных водителей в ride_region", $tags="new")
+    ContainerDb(driverDb, "Driver DB", "PostgreSQL", "Профили, локация, доступность водителей")
+    Container(redisCache, "Redis Cache", "Cache", "Не источник истины; потеря кэша допустима и восстанавливается из БД/событий", $tags="new")
+
+    Container(pricing, "Pricing Service", "Domain Service", "Локальная модель цены и surge в ride_region", $tags="new")
+    ContainerDb(pricingDb, "Pricing DB", "PostgreSQL", "Тарифы, surge-коэффициенты, история котировок")
+
+    Container(payments, "Payments Service", "Domain Service", "Авторизация и списание через локальный Payments Adapter ride_region", $tags="new")
+    ContainerDb(paymentsDb, "Payments DB", "PostgreSQL", "Транзакции, статусы платежей")
+
+    Container(payouts, "Payouts Service", "Domain Service", "Выплаты водителям")
+    ContainerDb(payoutsDb, "Payouts DB", "PostgreSQL", "Реестр заработка и выплаты водителей")
+
+    Container(notification, "Notification Service", "Domain Service", "Push и другие уведомления через локальный Notification Adapter ride_region", $tags="new")
+    ContainerDb(notificationDb, "Notification DB", "PostgreSQL", "Шаблоны, статусы доставки")
+
+    Container(geography, "Geography Service", "Domain Service", "Локальная карта, геопоиск и зоны спроса в ride_region", $tags="new")
+    ContainerDb(geographyDb, "Geography DB", "Elasticsearch", "Геообъекты, зоны, карта спроса")
+
+    Container(fraud, "Fraud Service", "Domain Service", "Fraud realtime в ride_region; профильные атрибуты только из claims/projection", $tags="new")
+    ContainerDb(fraudDb, "Fraud DB", "PostgreSQL", "Риск-скоринг, чёрные списки")
+
+    Container(analytics, "Analytics Service", "Domain Service", "Аналитика в реальном времени")
+    ContainerDb(analyticsDb, "ClickHouse", "ClickHouse", "Витрины и агрегаты (Spark/Flink, DataLens)")
+}
+
+Rel(passenger, mobileApps, "Использует")
+Rel(driverUser, mobileApps, "Использует")
+Rel(corpUser, webPortal, "Использует")
+Rel(admin, webPortal, "Использует")
+
+Rel(mobileApps, gslb, "Запросы", "HTTPS", $tags="new")
+Rel(webPortal, gslb, "Запросы", "HTTPS", $tags="new")
+Rel(gslb, ddosProtection, "Маршрутизация только в healthy region; draining/hold-down", "HTTPS", $tags="new")
+Rel(ddosProtection, waf, "Пропускает легитимный объём трафика")
+Rel(waf, securityGroups, "Пропускает трафик, прошедший фильтрацию правил")
+Rel(securityGroups, gateway, "Разрешённый по сетевым правилам трафик", "HTTPS/REST, gRPC")
+
+Rel(gateway, identity, "Проверка токена: tenant_id/profile_region; home_region только alias profile_region", "mTLS, JWT", $tags="new")
+Rel(gateway, rideRegionResolver, "Определяет ride_region для CreateBooking", "local policy", $tags="new")
+Rel(rideRegionResolver, geography, "Проверка pickup/city/market polygons", "mTLS", $tags="new")
+Rel(identity, profileProjection, "Асинхронная репликация разрешённых profile attributes", "eventual consistency", $tags="new")
+Rel(profileProjection, booking, "Read-only атрибуты без PII для hot path", "local read", $tags="new")
+Rel(gateway, monolith, "Маршрутизация legacy-запросов (доля трафика сокращается)", "HTTPS, mTLS")
+Rel(gateway, acl, "Маршрутизация к перенесённым доменам", "HTTPS, mTLS")
+
+Rel(acl, booking, "Вызов в ride_region", "gRPC, mTLS", $tags="new")
+Rel(acl, driverSvc, "Вызов в ride_region", "gRPC, mTLS", $tags="new")
+Rel(acl, pricing, "Вызов в ride_region", "gRPC, mTLS", $tags="new")
+Rel(acl, payments, "Вызов локального Payments Adapter в ride_region", "gRPC, mTLS", $tags="new")
+Rel(acl, payouts, "Вызов", "gRPC, mTLS")
+Rel(acl, geography, "Вызов локальной карты в ride_region", "gRPC, mTLS", $tags="new")
+Rel(acl, monolith, "Трансляция вызовов к невынесенным доменам", "HTTPS, mTLS")
+
+Rel(booking, bookingDb, "Читает/пишет", "SQL")
+Rel(driverSvc, driverDb, "Читает/пишет", "SQL")
+Rel(driverSvc, redisCache, "Читает/обновляет кэш; fallback к БД/событиям", "RESP", $tags="new")
+Rel(pricing, pricingDb, "Читает/пишет", "SQL")
+Rel(payments, paymentsDb, "Читает/пишет", "SQL")
+Rel(payouts, payoutsDb, "Читает/пишет", "SQL")
+Rel(notification, notificationDb, "Читает/пишет", "SQL")
+Rel(geography, geographyDb, "Читает/пишет", "REST")
+Rel(fraud, fraudDb, "Читает/пишет", "SQL")
+Rel(analytics, analyticsDb, "Читает/пишет", "SQL")
+
+Rel(booking, pricing, "Локальная котировка в ride_region", "gRPC/Kafka, mTLS", $tags="new")
+Rel(booking, driverSvc, "Матчинг локального водителя в ride_region", "gRPC/Kafka, mTLS", $tags="new")
+
+Rel(booking, kafka, "Публикует BookingCreated, BookingConfirmed, TripCompleted")
+Rel(driverSvc, kafka, "Публикует DriverLocationUpdated, DriverMatched")
+Rel(pricing, kafka, "Публикует PriceQuoted, SurgeZoneUpdated")
+Rel(payments, kafka, "Публикует PaymentAuthorized, PaymentCaptured, PaymentFailed")
+Rel(payouts, kafka, "Публикует PayoutInitiated, PayoutCompleted")
+Rel(geography, kafka, "Публикует HotZoneDetected, ZoneDemandUpdated")
+
+Rel(kafka, notification, "Подписка на доменные события")
+Rel(kafka, fraud, "Подписка на доменные события")
+Rel(kafka, analytics, "Подписка на доменные события")
+Rel(kafka, payouts, "Подписка на TripCompleted, PaymentCaptured")
+Rel(kafka, pricing, "Подписка на события Geography/Driver")
+
+Rel(payments, yandexPay, "Платежи в регионах, где провайдер допустим", "HTTPS", $tags="new")
+Rel(payments, bankApi, "Локальные платежи/банковские интеграции ride_region", "HTTPS", $tags="new")
+Rel(payouts, bankApi, "Выплаты", "HTTPS")
+Rel(geography, yandexMaps, "Карты и маршруты", "HTTPS")
+Rel(notification, pushProviders, "Push-уведомления", "HTTPS")
+
+Rel(monolithDb, cdc, "Логическая репликация", "WAL")
+Rel(cdc, kafka, "Публикует изменения как события")
+Rel(kafka, booking, "Односторонний CDC Monolith DB -> Service DB для backfill/shadow/reconciliation")
+Rel(kafka, payments, "Односторонний CDC Monolith DB -> Service DB для backfill/shadow/reconciliation")
+
+Rel(serviceMesh, gateway, "Выпуск/ротация сертификатов mTLS")
+Rel(serviceMesh, acl, "Выпуск/ротация сертификатов mTLS")
+Rel(serviceMesh, booking, "Выпуск/ротация сертификатов mTLS")
+Rel(serviceMesh, driverSvc, "Выпуск/ротация сертификатов mTLS")
+Rel(serviceMesh, pricing, "Выпуск/ротация сертификатов mTLS")
+Rel(serviceMesh, payments, "Выпуск/ротация сертификатов mTLS")
+Rel(serviceMesh, payouts, "Выпуск/ротация сертификатов mTLS")
+Rel(serviceMesh, notification, "Выпуск/ротация сертификатов mTLS")
+Rel(serviceMesh, geography, "Выпуск/ротация сертификатов mTLS")
+Rel(serviceMesh, fraud, "Выпуск/ротация сертификатов mTLS")
+Rel(serviceMesh, identity, "Выпуск/ротация сертификатов mTLS")
+Rel(serviceMesh, rideRegionResolver, "Выпуск/ротация сертификатов mTLS", $tags="new")
+Rel(serviceMesh, profileProjection, "Выпуск/ротация сертификатов mTLS", $tags="new")
+
+Rel(regionalHa, gateway, "PDB/topology spread/autoscaling для Tier-1 ingress", $tags="new")
+Rel(regionalHa, booking, "Multi-AZ stateless deployment, RTO pod/node <=1-2 мин", $tags="new")
+Rel(regionalHa, driverSvc, "Multi-AZ stateless deployment, RTO AZ <=5 мин", $tags="new")
+Rel(regionalHa, pricing, "Multi-AZ stateless deployment", $tags="new")
+Rel(regionalHa, payments, "Multi-AZ stateless deployment", $tags="new")
+Rel(drControl, bookingDb, "Fencing/promotion/failback PostgreSQL", $tags="new")
+Rel(drControl, paymentsDb, "Fencing/promotion/failback PostgreSQL", $tags="new")
+Rel(drControl, kafka, "DR cutover для разрешённых потоков; MirrorMaker 2 lag = RPO", $tags="new")
+
+Rel(secretsManager, identity, "Отдаёт секреты (креды, ключи)")
+Rel(secretsManager, payments, "Отдаёт секреты (ключи платёжных провайдеров)")
+Rel(secretsManager, rideRegionResolver, "Отдаёт конфигурацию tenant/market routing", $tags="new")
+Rel(secretsManager, serviceMesh, "Отдаёт корневые сертификаты mTLS")
+Rel(secretsManager, gateway, "Отдаёт секреты конфигурации")
+
+legend right
+  |Цвет|Значение|
+  |<back:red><color:white>Красный</color></back>|Новые или существенно изменённые элементы относительно Task1/c2-to-be.puml|
+endlegend
+
+@enduml
