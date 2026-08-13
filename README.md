@@ -9,7 +9,7 @@ Decision Records, см. [docs/adr-template.md](docs/adr-template.md)) повер
 ## Суть решения
 
 Декомпозиция монолита ведётся по стратегии **Strangler Fig** с
-**Database-per-Service**, без big bang: сервисы выделяются по годовому
+**Database-per-Service**: сервисы выделяются по годовому
 плану в порядке нарастающего риска (от почти stateless Notification до Booking —
 оркестратора, вокруг которого исторически завязан весь монолит), с
 API Gateway/ACL/feature-флагами для обратной совместимости и явным планом
